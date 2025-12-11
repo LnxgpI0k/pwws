@@ -42,6 +42,8 @@ pub struct Display {
   pub primary: DrmCtx,
   pub cursor: DrmCtx,
   pub overlays: Vec<DrmCtx>,
+  pub initial_primary_fb: Option<framebuffer::Handle>,
+  pub initial_cursor_fb: Option<framebuffer::Handle>,
 }
 
 #[derive(Debug)]
@@ -85,10 +87,6 @@ impl PartialEq for Display {
 }
 
 impl Display {
-  pub fn name(&self) -> &str {
-    &self.name
-  }
-
   pub fn init_req(
     &self,
     card: &Card,
@@ -227,6 +225,8 @@ pub fn init_displays(
       primary,
       cursor,
       overlays: vec![],
+      initial_primary_fb: None,
+      initial_cursor_fb: None,
     }, initial_primary_bo, initial_cursor_bo));
   }
   Ok(displays)

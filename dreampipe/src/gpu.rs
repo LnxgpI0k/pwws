@@ -8,6 +8,8 @@ use drm::control::plane;
 use drm::control::PlaneType;
 use drm::ClientCapability;
 use drm::Device;
+use gbm::AsRaw;
+use gbm_sys::gbm_surface_release_buffer;
 use crate::card::Card;
 use crate::display::Display;
 use crate::error::CompositorError;
@@ -194,7 +196,7 @@ impl GpuContext {
     for (_, display) in self.displays.iter() {
       let pos: (i32, i32) = display.pos.into();
       let key = (pos.1, pos.0);
-      displays.insert(key, (display.name().to_owned(), Size {
+      displays.insert(key, (display.name.to_owned(), Size {
         width: Dimension::length(display.size.0 as f32),
         height: Dimension::length(display.size.1 as f32),
       }));
@@ -271,7 +273,6 @@ impl GpuContext {
     let resources = (&self.card).resource_handles().map_err(|err| {
       CompositorError::ResourcesError(err)
     })?;
-    println!["Getting all connected connectors"];
     let connected: Vec<connector::Info> =
       resources
         .connectors()
@@ -288,7 +289,6 @@ impl GpuContext {
         .map_err(|err| CompositorError::GetPlanes(err))?
         .into_iter()
         .collect();
-    println!["Organizing the display objects."];
     let max_displays = resources.crtcs().len().min(connected.len());
     let mut displays = Vec::new();
     for (
@@ -364,6 +364,8 @@ impl GpuContext {
         primary,
         cursor,
         overlays: vec![],
+        initial_primary_fb: None,
+        initial_cursor_fb: None,
       }, initial_primary_bo, initial_cursor_bo));
     }
     Ok(displays)
@@ -379,10 +381,13 @@ impl GpuContext {
       tracing::warn!["Failed to init displays: {e}"];
       Default::default()
     });
-
-    // Modeset all newly connected displays.
+    if !new_displays.is_empty() {
+      for (display, _, _) in new_displays.iter() {
+        println!["Found display: {} {:?}", display.name, display.size];
+      }
+      // Modeset all newly connected displays.
+    }
     for (display, initial_primary_bo, initial_cursor_bo) in new_displays.iter_mut() {
-      println!["Found display {}", display.name()];
       self
         .egl
         .make_current(
@@ -432,10 +437,8 @@ impl GpuContext {
           atomic_req,
         )
         .expect("Failed to set mode");
-      self
-        .card
-        .destroy_framebuffer(initial_primary_fb)
-        .expect("Failed to destroy initial framebuffer");
+      display.initial_primary_fb = Some(initial_primary_fb);
+      display.initial_cursor_fb = Some(initial_cursor_fb);
     }
 
     // If we have new displays, add them to the display tree
@@ -445,7 +448,7 @@ impl GpuContext {
         .extend(
           new_displays
             .into_iter()
-            .map(|(display, _, _)| (display.name().to_owned(), display)),
+            .map(|(display, _, _)| (display.name.to_owned(), display)),
         );
       for (name, display) in self.displays.iter_mut() {
         let pos = config.get::<DisplayPosition>(&CompositorConfig::offset_key(name));
@@ -465,8 +468,12 @@ impl GpuContext {
     // 4. wait for vsync
     // NOTE: Each GPU corresponds to its own virtual desktop for now
     let events = match self.card.receive_events() {
-      Ok(events) => events.peekable(),
+      Ok(events) => {
+        println!["Ready to receive events!"];
+        events.peekable()
+      },
       Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+        println!["Would block"];
         return;
       },
       Err(e) => panic!["{e}"],
@@ -475,6 +482,7 @@ impl GpuContext {
       |event| {
         match event {
           drm::control::Event::PageFlip(event) => {
+            println!["Got page flip event"];
             let mut to_remove = Vec::new();
             for id in self.leaf_ids.iter().map(|id| {
               let k = self.layout.get_node_context(*id).unwrap();
@@ -484,8 +492,29 @@ impl GpuContext {
               if display.crtc != event.crtc {
                 continue;
               }
+              if let Some(old_bo) = display.primary.previous_bo.take() {
+                unsafe {
+                  gbm_surface_release_buffer(
+                    display.primary.gbmsurface.as_raw_mut(),
+                    old_bo.as_raw_mut(),
+                  );
+                }
+              }
 
+              // if let Some(fb) = display.initial_primary_fb.take() {
+              //   self
+              //     .card
+              //     .destroy_framebuffer(fb)
+              //     .expect("Failed to destroy initial framebuffer");
+              // }
+              // if let Some(fb) = display.initial_cursor_fb.take() {
+              //   self
+              //     .card
+              //     .destroy_framebuffer(fb)
+              //     .expect("Failed to destroy initial framebuffer");
+              // }
               // Draw to the back buffer
+              println!["Blitting to the framebuffer for {}", display.name];
               self
                 .egl
                 .make_current(
@@ -517,13 +546,16 @@ impl GpuContext {
               //? SAFETY: This is safe here because we are calling it right after a page flip
               //? event, indicating the hardware is no longer using it
               match unsafe {
-                display.primary.swap(&self.card, self.egl.as_ref(), &self.egldisplay)
+                display
+                  .primary
+                  .swap(&self.card, self.egl.as_ref(), &self.egldisplay, display.crtc)
               } {
                 Ok(()) => (),
                 // Probably disconnected: remove the display from the list
-                Err(_) => if let Ok(info) = self.card.get_connector(display.connector, false) {
+                Err(e) => if let Ok(info) = self.card.get_connector(display.connector, false) {
+                  println!["Got an error: {e}"];
                   if info.state() != connector::State::Connected {
-                    to_remove.push(display.name().to_owned());
+                    to_remove.push(display.name.to_owned());
                   }
                 },
               }
@@ -543,6 +575,18 @@ impl GpuContext {
                   for fb in overlay.fbs.into_inner().values() {
                     self.card.destroy_framebuffer(*fb).ok();
                   }
+                }
+                if let Some(fb) = display.initial_primary_fb {
+                  self
+                    .card
+                    .destroy_framebuffer(fb)
+                    .expect("Failed to destroy initial framebuffer");
+                }
+                if let Some(fb) = display.initial_cursor_fb {
+                  self
+                    .card
+                    .destroy_framebuffer(fb)
+                    .expect("Failed to destroy initial framebuffer");
                 }
               }
             }
