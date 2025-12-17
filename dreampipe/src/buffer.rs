@@ -7,20 +7,14 @@ use drm::control::AtomicCommitFlags;
 pub use drm::control::Device as ControlDevice;
 use drm::control::PlaneType;
 use drm::control::ResourceHandles;
-use gbm::AsRaw;
 use gbm::BufferObjectFlags;
-use khregl::ATTRIB_NONE;
-use khregl::EGL1_5;
-use std::cell::UnsafeCell;
 use std::collections::HashMap;
 use std::collections::HashSet;
-use std::os::fd::AsRawFd;
 use crate::error::CompositorError;
 use crate::error::CompositorResult;
 use crate::card::Card;
 use crate::fourcc::FourCc;
 use crate::DRM_FORMAT;
-use std::os::raw::c_void;
 
 pub const CURSOR_DIM: u32 = 64;
 
@@ -87,287 +81,230 @@ fn make_buffer(
       .map_err(|err| {
         CompositorError::GbmCreation(err)
       })?;
-
-  // let framebuffer =
-  //    card
-  //       .add_framebuffer(&buffer, DRM_FORMAT.depth(), DRM_FORMAT.bpp())
-  //       .map_err(|err| CompositorError::AddFrameBuffer(err))?;
   Ok(buffer)
 }
 
-fn make_surfaces(
-  gbm: &gbm::Device<&'static Card>,
-  egl: &khregl::DynamicInstance<EGL1_5>,
-  config: &khregl::Config,
-  egldisplay: &khregl::Display,
-  planetype: PlaneType,
-  (width, height): (u32, u32),
-) -> CompositorResult<(gbm::Surface<&'static Card>, khregl::Surface)> {
-  let planeflag = match planetype {
-    PlaneType::Overlay | PlaneType::Primary => BufferObjectFlags::SCANOUT,
-    PlaneType::Cursor => BufferObjectFlags::CURSOR,
-  };
-  let gbmsurface =
-    gbm
-      .create_surface::<&'static Card>(
-        width,
-        height,
-        DRM_FORMAT,
-        planeflag | BufferObjectFlags::RENDERING,
-      )
-      .map_err(|e| CompositorError::GbmSurfaceCreate(e))?;
-  let eglsurface =
-    unsafe {
-      egl.create_platform_window_surface(
-        *egldisplay,
-        *config,
-        gbmsurface.as_raw() as *mut c_void,
-        &[ATTRIB_NONE],
-      )
-    }.map_err(|e| CompositorError::EglSurfaceCreate(e))?;
-  Ok((gbmsurface, eglsurface))
+#[derive(Debug)]
+pub struct TripleBuffer {
+  pub draw: usize,
+  pub scan: usize,
+  pub bos: [gbm::BufferObject<()>; 3],
+  pub fbs: [framebuffer::Handle; 3],
+}
+
+impl TripleBuffer {
+  pub fn new(
+    card: &Card,
+    gbm: &gbm::Device<&Card>,
+    planetype: PlaneType,
+    size: (u32, u32),
+  ) -> CompositorResult<Self> {
+    let [a, b, c] =
+      std::array::from_fn(|_| make_buffer(card, gbm, planetype, size));
+    let buffers = [a?, b?, c?];
+    let [a, b, c] =
+      std::array::from_fn(
+        |i| card
+          .add_framebuffer(&buffers[i], DRM_FORMAT.depth(), DRM_FORMAT.bpp())
+          .map_err(|e| CompositorError::AddFrameBuffer(e)),
+      );
+    let framebuffers = [a?, b?, c?];
+    Ok(Self {
+      scan: 0,
+      draw: 0,
+      bos: buffers,
+      fbs: framebuffers,
+    })
+  }
+
+  pub fn swap(&mut self) {
+    self.scan = self.draw;
+    self.draw = (self.draw + 1) % 3;
+  }
 }
 
 #[derive(Debug)]
 pub struct DrmCtx {
-  pub plane: Option<plane::Handle>,
+  pub plane: plane::Handle,
   pub plane_props: HashMap<String, property::Info>,
   pub size: (u32, u32),
-  pub previous_bo: Option<gbm::BufferObject<&'static Card>>,
-  // NOTE: All framebuffers must be dropped prior to changing surface config
-  pub fbs: UnsafeCell<HashMap<i32, framebuffer::Handle>>,
-  pub gbmsurface: gbm::Surface<&'static Card>,
-  pub eglsurface: khregl::Surface,
+  pub buffers: TripleBuffer,
 }
 
 impl DrmCtx {
   pub fn new(
     card: &Card,
     gbm: &gbm::Device<&'static Card>,
-    egl: &khregl::DynamicInstance<EGL1_5>,
-    config: &khregl::Config,
-    egldisplay: &khregl::Display,
-    plane: Option<plane::Handle>,
+    plane: plane::Handle,
     planetype: PlaneType,
     size: (u32, u32),
-  ) -> CompositorResult<(Self, gbm::BufferObject<()>)> {
-    let (gbmsurface, eglsurface) =
-      make_surfaces(gbm, egl, config, egldisplay, planetype, size)?;
+  ) -> CompositorResult<Self> {
     let plane_props =
-      if let Some(plane) = plane {
-        card
-          .get_properties(plane)
-          .map_err(|err| CompositorError::GetPlaneProperties(plane, err))?
-          .as_hashmap(card)
-          .map_err(|err| CompositorError::PropsToHashMap(err))?
-      } else {
-        HashMap::new()
-      };
-    let initial_buffer = make_buffer(card, gbm, planetype, size)?;
-    let fbs = HashMap::new();
-    Ok((Self {
+      card
+        .get_properties(plane)
+        .map_err(|err| CompositorError::GetPlaneProperties(plane, err))?
+        .as_hashmap(card)
+        .map_err(|err| CompositorError::PropsToHashMap(err))?;
+    let buffers = TripleBuffer::new(card, gbm, planetype, size)?;
+    Ok(Self {
       plane,
       plane_props,
       size,
-      previous_bo: None,
-      fbs: fbs.into(),
-      gbmsurface,
-      eglsurface,
-    }, initial_buffer))
+      buffers,
+    })
   }
 
   pub fn from_connector(
     card: &Card,
     gbm: &gbm::Device<&'static Card>,
-    egl: &khregl::DynamicInstance<EGL1_5>,
-    config: &khregl::Config,
-    egldisplay: &khregl::Display,
     resources: &ResourceHandles,
     crtc: crtc::Handle,
     planes: &mut HashSet<plane::Handle>,
     planetype: PlaneType,
     size: (u32, u32),
-  ) -> CompositorResult<(Self, gbm::BufferObject<()>)> {
+  ) -> CompositorResult<Self> {
     let plane = find_compatible_plane(card, resources, crtc, planes, planetype);
     if let Some(plane) = plane {
-      let _ = planes.remove(&plane);
+      Self::new(card, gbm, plane, planetype, size)
+    } else {
+      Err(
+        CompositorError::NoCompatiblePrimaryPlane(
+          card.get_crtc(crtc).map_err(|e| CompositorError::GetCrtcInfo(crtc, e))?,
+        ),
+      )
     }
-    Self::new(card, gbm, egl, config, egldisplay, plane, planetype, size)
   }
 
-  fn get_fb(
-    &self,
-    card: &Card,
-    bo: &gbm::BufferObject<&'static Card>,
-  ) -> CompositorResult<framebuffer::Handle> {
-    let fd = bo.fd().map_err(|e| CompositorError::GbmFd(e))?.as_raw_fd();
-    if let Some(fb) = unsafe {
-      self.fbs.get().as_ref().unwrap().get(&fd)
-    } {
-      Ok(*fb)
-    } else {
-      let fb =
-        card
-          .add_framebuffer(bo, DRM_FORMAT.depth(), DRM_FORMAT.bpp())
-          .map_err(|err| CompositorError::AddFrameBuffer(err))?;
-      let fbs = (unsafe {
-        &mut *self.fbs.get()
-      }) as &mut HashMap<i32, framebuffer::Handle>;
-      fbs.insert(fd, fb);
-      Ok(fb)
-    }
+  fn get_draw_fb(&self) -> framebuffer::Handle {
+    self.buffers.fbs[self.buffers.draw]
   }
 
   pub fn init_req(
     &self,
-    card: &Card,
-    initial_fb: framebuffer::Handle,
     atomic_req: &mut atomic::AtomicModeReq,
     crtc: crtc::Handle,
   ) -> CompositorResult<()> {
-    if let Some(plane) = self.plane {
-      let props = &self.plane_props;
-      atomic_req.add_property(
-        plane,
-        props["FB_ID"].handle(),
-        property::Value::Framebuffer(Some(initial_fb)),
-      );
-      atomic_req.add_property(
-        plane,
-        props["CRTC_ID"].handle(),
-        property::Value::CRTC(Some(crtc)),
-      );
-      atomic_req.add_property(
-        plane,
-        props["SRC_X"].handle(),
-        property::Value::UnsignedRange(0),
-      );
-      atomic_req.add_property(
-        plane,
-        props["SRC_Y"].handle(),
-        property::Value::UnsignedRange(0),
-      );
-      atomic_req.add_property(
-        plane,
-        props["SRC_W"].handle(),
-        property::Value::UnsignedRange((self.size.0 as u64) << 16),
-      );
-      atomic_req.add_property(
-        plane,
-        props["SRC_H"].handle(),
-        property::Value::UnsignedRange((self.size.1 as u64) << 16),
-      );
-      atomic_req.add_property(
-        plane,
-        props["CRTC_X"].handle(),
-        property::Value::SignedRange(0),
-      );
-      atomic_req.add_property(
-        plane,
-        props["CRTC_Y"].handle(),
-        property::Value::SignedRange(0),
-      );
-      atomic_req.add_property(
-        plane,
-        props["CRTC_W"].handle(),
-        property::Value::UnsignedRange(self.size.0 as u64),
-      );
-      atomic_req.add_property(
-        plane,
-        props["CRTC_H"].handle(),
-        property::Value::UnsignedRange(self.size.1 as u64),
-      );
-    }
+    let plane = self.plane;
+    let props = &self.plane_props;
+    atomic_req.add_property(
+      plane,
+      props["FB_ID"].handle(),
+      property::Value::Framebuffer(Some(self.buffers.fbs[0])),
+    );
+    atomic_req.add_property(
+      plane,
+      props["CRTC_ID"].handle(),
+      property::Value::CRTC(Some(crtc)),
+    );
+    atomic_req.add_property(
+      plane,
+      props["SRC_X"].handle(),
+      property::Value::UnsignedRange(0),
+    );
+    atomic_req.add_property(
+      plane,
+      props["SRC_Y"].handle(),
+      property::Value::UnsignedRange(0),
+    );
+    atomic_req.add_property(
+      plane,
+      props["SRC_W"].handle(),
+      property::Value::UnsignedRange((self.size.0 as u64) << 16),
+    );
+    atomic_req.add_property(
+      plane,
+      props["SRC_H"].handle(),
+      property::Value::UnsignedRange((self.size.1 as u64) << 16),
+    );
+    atomic_req.add_property(
+      plane,
+      props["CRTC_X"].handle(),
+      property::Value::SignedRange(0),
+    );
+    atomic_req.add_property(
+      plane,
+      props["CRTC_Y"].handle(),
+      property::Value::SignedRange(0),
+    );
+    atomic_req.add_property(
+      plane,
+      props["CRTC_W"].handle(),
+      property::Value::UnsignedRange(self.size.0 as u64),
+    );
+    atomic_req.add_property(
+      plane,
+      props["CRTC_H"].handle(),
+      property::Value::UnsignedRange(self.size.1 as u64),
+    );
     Ok(())
   }
 
-  /// SAFETY: This function must be called exactly once after a page flip event, not
-  /// before
   pub unsafe fn swap(
     &mut self,
     card: &Card,
-    egl: &khregl::DynamicInstance<EGL1_5>,
-    display: &khregl::Display,
     crtc: crtc::Handle,
   ) -> CompositorResult<()> {
-    if let Some(plane) = self.plane {
-      // 1. Lock the front buffer we just finished rendering into
-      let bo =
-        unsafe {
-          self
-            .gbmsurface
-            .lock_front_buffer()
-            .map_err(|_| CompositorError::FrontBufferLock)?
-        };
+    let plane = self.plane;
 
-      // 2. Tell EGL we're done with it
-      egl
-        .swap_buffers(*display, self.eglsurface)
-        .map_err(|e| CompositorError::BufferSwap(e))?;
-
-      // 3. Get/create a framebuffer for the new BO
-      let fb = self.get_fb(card, &bo)?;
-
-      // Queue a page flip
-      let mut atomic_req = atomic::AtomicModeReq::new();
-      atomic_req.add_property(
-        plane,
-        self.plane_props["FB_ID"].handle(),
-        property::Value::Framebuffer(Some(fb)),
-      );
-      atomic_req.add_property(
-        plane,
-        self.plane_props["CRTC_ID"].handle(),
-        property::Value::CRTC(Some(crtc)),
-      );
-      atomic_req.add_property(
-        plane,
-        self.plane_props["SRC_X"].handle(),
-        property::Value::UnsignedRange(0),
-      );
-      atomic_req.add_property(
-        plane,
-        self.plane_props["SRC_Y"].handle(),
-        property::Value::UnsignedRange(0),
-      );
-      atomic_req.add_property(
-        plane,
-        self.plane_props["SRC_W"].handle(),
-        property::Value::UnsignedRange((self.size.0 << 16) as u64),
-      );
-      atomic_req.add_property(
-        plane,
-        self.plane_props["SRC_H"].handle(),
-        property::Value::UnsignedRange((self.size.1 << 16) as u64),
-      );
-      atomic_req.add_property(
-        plane,
-        self.plane_props["CRTC_X"].handle(),
-        property::Value::UnsignedRange(0),
-      );
-      atomic_req.add_property(
-        plane,
-        self.plane_props["CRTC_Y"].handle(),
-        property::Value::UnsignedRange(0),
-      );
-      atomic_req.add_property(
-        plane,
-        self.plane_props["CRTC_W"].handle(),
-        property::Value::UnsignedRange(self.size.0 as u64),
-      );
-      atomic_req.add_property(
-        plane,
-        self.plane_props["CRTC_H"].handle(),
-        property::Value::UnsignedRange(self.size.1 as u64),
-      );
-      card
-        .atomic_commit(
-          AtomicCommitFlags::NONBLOCK | AtomicCommitFlags::PAGE_FLIP_EVENT,
-          atomic_req,
-        )
-        .map_err(|err| CompositorError::AtomicCommitFailed(err))?;
-      self.previous_bo = Some(bo);
-    }
+    // Queue a page flip
+    let mut atomic_req = atomic::AtomicModeReq::new();
+    atomic_req.add_property(
+      plane,
+      self.plane_props["FB_ID"].handle(),
+      property::Value::Framebuffer(Some(self.get_draw_fb())),
+    );
+    atomic_req.add_property(
+      plane,
+      self.plane_props["CRTC_ID"].handle(),
+      property::Value::CRTC(Some(crtc)),
+    );
+    atomic_req.add_property(
+      plane,
+      self.plane_props["SRC_X"].handle(),
+      property::Value::UnsignedRange(0),
+    );
+    atomic_req.add_property(
+      plane,
+      self.plane_props["SRC_Y"].handle(),
+      property::Value::UnsignedRange(0),
+    );
+    atomic_req.add_property(
+      plane,
+      self.plane_props["SRC_W"].handle(),
+      property::Value::UnsignedRange((self.size.0 << 16) as u64),
+    );
+    atomic_req.add_property(
+      plane,
+      self.plane_props["SRC_H"].handle(),
+      property::Value::UnsignedRange((self.size.1 << 16) as u64),
+    );
+    atomic_req.add_property(
+      plane,
+      self.plane_props["CRTC_X"].handle(),
+      property::Value::SignedRange(0),
+    );
+    atomic_req.add_property(
+      plane,
+      self.plane_props["CRTC_Y"].handle(),
+      property::Value::SignedRange(0),
+    );
+    atomic_req.add_property(
+      plane,
+      self.plane_props["CRTC_W"].handle(),
+      property::Value::UnsignedRange(self.size.0 as u64),
+    );
+    atomic_req.add_property(
+      plane,
+      self.plane_props["CRTC_H"].handle(),
+      property::Value::UnsignedRange(self.size.1 as u64),
+    );
+    card
+      .atomic_commit(
+        AtomicCommitFlags::NONBLOCK | AtomicCommitFlags::PAGE_FLIP_EVENT,
+        atomic_req,
+      )
+      .map_err(|err| CompositorError::AtomicCommitFailed(err))?;
+    self.buffers.swap();
     Ok(())
   }
 }

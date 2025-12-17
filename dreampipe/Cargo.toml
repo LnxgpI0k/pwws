@@ -7,6 +7,7 @@ edition = "2024"
 expanding = []
 
 [dependencies]
+cef = { version = "143.1.0", features = ["accelerated_osr", "wgpu"] }
 colpetto = "0.6.0"
 crossbeam = { version = "0.8.4", features = ["crossbeam-channel"] }
 drm = "0.14.1"
@@ -15,10 +16,7 @@ futures = "0.3.31"
 futures-io = "0.3.31"
 gbm = "0.18.0"
 gbm-sys = "0.4.0"
-gl = "0.14.0"
-gridmap = "0.0.2"
 image = "0.25.8"
-khregl = { package = "khronos-egl", version = "6.0.0", features = ["dynamic", "static"] }
 libc = "0.2.177"
 libloading = "0.8.9"
 microxdg = "0.2.0"
@@ -29,3 +27,4 @@ pipewire-sys = { git = "https://gitlab.freedesktop.org/pipewire/pipewire-rs.git"
 rand = "0.9.2"
 taffy = "0.9.2"
 tracing = "0.1.41"
+wgpu = "27.0.1"

@@ -16,7 +16,7 @@ pub type CompositorResult<T> = std::result::Result<T, CompositorError>;
 #[derive(Debug)]
 pub enum CompositorError {
    OpenCard(PathBuf, IoError),
-   // GpuCard,
+   GpuCard,
    // GpuDeviceAsHal,
    // VulkanImageCreate(vk::Result),
    // VulkanMemoryAlloc(vk::Result),
@@ -28,8 +28,8 @@ pub enum CompositorError {
    GbmFd(InvalidFdError),
    GbmSurfaceCreate(IoError),
    FrontBufferLock,
-   BufferSwap(khregl::Error),
-   EglSurfaceCreate(khregl::Error),
+   // BufferSwap(khregl::Error),
+   // EglSurfaceCreate(khregl::Error),
    AddFrameBuffer(IoError),
    GetPlanes(IoError),
    NoCompatiblePrimaryPlane(crtc::Info),
@@ -56,7 +56,7 @@ impl Display for CompositorError {
             Self::OpenCard(path, error) => format![
                "Unable to open card at {path:?}: {error:#?}"
             ],
-            // Self::GpuCard => format!["No matching card for selected GPU"],
+            Self::GpuCard => format!["No matching card for selected GPU"],
             // Self::GpuDeviceAsHal => format!["Failed to get wgpu device as hal"],
             Self::ClientCapability(client_capability, error) => format![
                "Unable to request {client_capability:#?}: {error:#?}"
@@ -73,10 +73,10 @@ impl Display for CompositorError {
                "Failed to create GBM surface: {error:#?}"
             ],
             Self::FrontBufferLock => format!["Failed to lock front buffer"],
-            Self::BufferSwap(error) => format!["Failed to swap buffers: {error:#?}"],
-            Self::EglSurfaceCreate(error) => format![
-               "Failed to create EGL surface: {error:#?}"
-            ],
+            // Self::BufferSwap(error) => format!["Failed to swap buffers: {error:#?}"],
+            // Self::EglSurfaceCreate(error) => format![
+            //    "Failed to create EGL surface: {error:#?}"
+            // ],
             Self::AddFrameBuffer(error) => format![
                "Failed to add framebuffer to card: {error:#?}"
             ],

@@ -1,7 +1,15 @@
-use khregl::DynamicInstance;
-use khregl::EGL1_5;
+use crate::display::Display;
+use std::collections::BTreeMap;
+use std::collections::HashMap;
 use std::os::raw::c_void;
 use std::str::FromStr;
+use taffy::Dimension;
+use taffy::Display as NodeDisplay;
+use taffy::FlexDirection;
+use taffy::NodeId;
+use taffy::Size;
+use taffy::Style;
+use taffy::TaffyTree;
 
 pub struct DisplayPosition {
   x: u32,
@@ -58,62 +66,81 @@ pub enum Direction {
   West,
 }
 
-pub fn create_context(
-  egl: &khregl::DynamicInstance,
-  display: khregl::Display,
-) -> (khregl::Context, khregl::Config) {
-  let attributes =
-    [
-      khregl::RED_SIZE,
-      8,
-      khregl::GREEN_SIZE,
-      8,
-      khregl::BLUE_SIZE,
-      8,
-      khregl::ALPHA_SIZE,
-      8,
-      khregl::SURFACE_TYPE,
-      khregl::WINDOW_BIT,
-      khregl::RENDERABLE_TYPE,
-      khregl::OPENGL_ES3_BIT,
-      khregl::NONE,
-    ];
-  let config =
-    egl
-      .choose_first_config(display, &attributes)
-      .expect("unable to choose an EGL configuration")
-      .expect("no EGL configuration found");
-  let context_attributes = [khregl::CONTEXT_CLIENT_VERSION, 3, khregl::NONE];
-  let context =
-    egl
-      .create_context(display, config, None, &context_attributes)
-      .expect("unable to create an EGL context");
-  (context, config)
-}
-
 #[allow(non_snake_case)]
 pub struct GlFns {
   pub EGLImageTargetTexture2DOES: unsafe extern "system" fn(u32, *const c_void),
 }
 
-impl GlFns {
-  pub fn load(egl: &DynamicInstance<EGL1_5>) -> GlFns {
-    GlFns {
-      EGLImageTargetTexture2DOES: unsafe {
-        std::mem::transmute(
-          egl.get_proc_address("glEGLImageTargetTexture2DOES").unwrap() as *const c_void,
-        )
-      },
-    }
-  }
-}
-
 #[allow(dead_code)]
 pub struct BackgroundImage {
   pub bo: gbm::BufferObject<()>,
-  pub egl_image: khregl::Image,
   pub tex_id: u32,
   pub fb_id: u32,
   pub width: i32,
   pub height: i32,
+}
+
+pub fn layout_displays(
+  mut displays: HashMap<String, &mut Display>,
+) -> (TaffyTree<String>, Vec<NodeId>) {
+  let mut sorted = BTreeMap::new();
+  for (_, display) in displays.iter() {
+    let pos: (i32, i32) = display.pos.into();
+    let key = (pos.1, pos.0);
+    sorted.insert(key, (display.name.to_owned(), Size {
+      width: Dimension::length(display.size.0 as f32),
+      height: Dimension::length(display.size.1 as f32),
+    }));
+  }
+  let mut tree: TaffyTree<String> = TaffyTree::<String>::new();
+  let mut leafs = Vec::new();
+  let mut hnodes = Vec::new();
+  let mut vnodes = Vec::new();
+  let mut prev_y = 0;
+  for ((y, _), (name, size)) in sorted {
+    if y > prev_y {
+      let node = tree.new_with_children(Style {
+        flex_direction: FlexDirection::Row,
+        flex_grow: 0.0,
+        flex_wrap: taffy::FlexWrap::NoWrap,
+        flex_shrink: 0.0,
+        ..Default::default()
+      }, &hnodes).unwrap();
+      vnodes.push(node);
+      leafs.extend(hnodes.drain(..));
+    }
+    prev_y = y;
+    hnodes.push(tree.new_leaf_with_context(Style {
+      display: NodeDisplay::Block,
+      size,
+      min_size: size,
+      max_size: size,
+      flex_grow: 0.0,
+      flex_shrink: 0.0,
+      ..Default::default()
+    }, name).unwrap());
+  }
+  {
+    let node = tree.new_with_children(Style {
+      flex_direction: FlexDirection::Row,
+      flex_grow: 0.0,
+      flex_wrap: taffy::FlexWrap::NoWrap,
+      flex_shrink: 0.0,
+      ..Default::default()
+    }, &hnodes).unwrap();
+    vnodes.push(node);
+    leafs.extend(hnodes.drain(..));
+  }
+  let root_node = tree.new_with_children(Style {
+    flex_direction: FlexDirection::Column,
+    ..Default::default()
+  }, &vnodes).unwrap();
+  tree.compute_layout(root_node, Size::max_content()).unwrap();
+  for leaf in leafs.iter() {
+    let nym = tree.get_node_context(*leaf).unwrap();
+    let display = displays.get_mut(nym).unwrap();
+    let pos = tree.layout(*leaf).unwrap().location;
+    display.pos = (pos.x as i32, pos.y as i32);
+  }
+  (tree, leafs)
 }
