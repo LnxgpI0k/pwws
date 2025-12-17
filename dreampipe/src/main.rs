@@ -6,17 +6,15 @@ mod error;
 mod fourcc;
 mod gpu;
 mod util;
-mod render;
 
 use config::Config;
-use taffy::NodeId;
+use crate::buffer::DRM_FORMAT;
 use crate::card::Card;
+use crate::card::GpuContext;
 use crate::config::CompositorConfig;
 use crate::display::Display;
-use crate::gpu::GpuContext;
-use crate::util::BackgroundImage;
+use crate::gpu::init_gpu;
 use crate::util::layout_displays;
-use drm::buffer::DrmFourcc;
 use drm::control::Device as ControlDevice;
 use gbm::BufferObjectFlags;
 use image::DynamicImage;
@@ -28,14 +26,13 @@ use notify::Event as NotifyEvent;
 use notify::RecursiveMode;
 use notify::Watcher;
 use std::collections::HashMap;
-use std::ffi::c_void;
 use std::time::Duration;
 use std::time::Instant;
+use taffy::NodeId;
 use taffy::TaffyTree;
 
 // 65536x65536
 pub const VIRTUAL_SCREEN_EXTENTS: (i32, i32) = (0x1000, 0x1000);
-pub const DRM_FORMAT: DrmFourcc = DrmFourcc::Xrgb8888;
 
 fn load_default_bg() -> DynamicImage {
   // This cfg is for display purposes when concatenating the entire project together.
@@ -50,7 +47,8 @@ fn load_default_bg() -> DynamicImage {
   bg
 }
 
-fn main() {
+#[tokio::main]
+async fn main() {
   // Initialize config watcher
   let config_path = CompositorConfig::config_path().unwrap_or("/dev/null".into());
   let (mut tx, mut rx) = crossbeam::channel::bounded(2);
@@ -130,10 +128,13 @@ fn main() {
     bgbo.map_mut(0, 0, aligned_width, aligned_height, |map| {
       map.buffer_mut().copy_from_slice(padded.as_rgba8().unwrap());
     }).unwrap();
+    let (gpu, adapter, pipeline) =
+      init_gpu(card_ref).await.expect("Failed to init wgpu");
     let displays: Vec<Display> = Vec::new();
     let context = GpuContext {
       card,
       gbm,
+      gpu,
       displays,
     };
     contexts.push(context);

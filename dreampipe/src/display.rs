@@ -107,6 +107,7 @@ impl Display {
     ignore_list: impl Into<Option<HashSet<String>>>,
     card: &Card,
     gbm: &gbm::Device<&'static Card>,
+    gpu: &wgpu::Device,
   ) -> CompositorResult<Vec<Display>> {
     let ignore_list = ignore_list.into();
     for (
@@ -165,6 +166,7 @@ impl Display {
         DrmCtx::from_connector(
           card,
           gbm,
+          gpu,
           &resources,
           crtc,
           &mut planes,
@@ -175,6 +177,7 @@ impl Display {
         DrmCtx::from_connector(
           card,
           gbm,
+          gpu,
           &resources,
           crtc,
           &mut planes,
