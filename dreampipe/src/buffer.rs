@@ -16,7 +16,7 @@ use crate::card::Card;
 use crate::fourcc::FourCc;
 use crate::DRM_FORMAT;
 
-pub const CURSOR_DIM: u32 = 64;
+pub const CURSOR_DIM: u32 = 128;
 
 fn is_plane_compatible_with_crtc(
   card: &Card,

@@ -4,8 +4,9 @@ mod config;
 mod display;
 mod error;
 mod fourcc;
-mod util;
 mod gpu;
+mod util;
+mod render;
 
 use config::Config;
 use taffy::NodeId;
@@ -14,11 +15,9 @@ use crate::config::CompositorConfig;
 use crate::display::Display;
 use crate::gpu::GpuContext;
 use crate::util::BackgroundImage;
-use crate::util::GlFns;
 use crate::util::layout_displays;
 use drm::buffer::DrmFourcc;
 use drm::control::Device as ControlDevice;
-use gbm::AsRaw;
 use gbm::BufferObjectFlags;
 use image::DynamicImage;
 use image::GenericImage;
@@ -30,19 +29,9 @@ use notify::RecursiveMode;
 use notify::Watcher;
 use std::collections::HashMap;
 use std::ffi::c_void;
-use std::sync::Arc;
 use std::time::Duration;
 use std::time::Instant;
 use taffy::TaffyTree;
-
-const EGL_NO_CONTEXT: *mut c_void = std::ptr::null_mut();
-const EGL_PLATFORM_GBM_KHR: u32 = 0x31D7;
-const EGL_LINUX_DMA_BUF_EXT: u32 = 0x3270;
-const EGL_LINUX_DRM_FOURCC_EXT: usize = 12913;
-const EGL_DMA_BUF_PLANE0_FD_EXT: usize = 12914;
-const EGL_DMA_BUF_PLANE0_OFFSET_EXT: usize = 12915;
-const EGL_DMA_BUF_PLANE0_PITCH_EXT: usize = 12916;
-const EGL_NATIVE_PIXMAP_KHR: u32 = 12464;
 
 // 65536x65536
 pub const VIRTUAL_SCREEN_EXTENTS: (i32, i32) = (0x1000, 0x1000);
@@ -154,7 +143,7 @@ fn main() {
   let mut layout: TaffyTree<String> = TaffyTree::new();
   let mut leaf_ids: Vec<NodeId> = Vec::new();
   loop {
-    let mut displays_acquired = false;
+    let mut displays_changed = false;
 
     // Update configuration and such
     match rx.try_recv() {
@@ -178,14 +167,14 @@ fn main() {
       },
     }
     for context in contexts.iter_mut() {
-      context.update();
-      displays_acquired |= context.init_displays(&config);
+      displays_changed |= context.update();
+      displays_changed |= context.init_displays(&config);
     }
     if Instant::now().checked_duration_since(end).is_some() {
       break;
     }
     frame += 1;
-    if displays_acquired {
+    if displays_changed {
       let displays: HashMap<String, &mut Display> =
         contexts
           .iter_mut()
