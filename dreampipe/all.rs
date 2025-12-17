@@ -1,8 +1,8 @@
 #![feature(prelude_import)]
-#[prelude_import]
-use std::prelude::rust_2024::*;
 #[macro_use]
 extern crate std;
+#[prelude_import]
+use std::prelude::rust_2024::*;
 mod buffer {
     use drm::control::atomic;
     use drm::control::crtc;
@@ -13,20 +13,14 @@ mod buffer {
     pub use drm::control::Device as ControlDevice;
     use drm::control::PlaneType;
     use drm::control::ResourceHandles;
-    use gbm::AsRaw;
     use gbm::BufferObjectFlags;
-    use khregl::ATTRIB_NONE;
-    use khregl::EGL1_5;
-    use std::cell::UnsafeCell;
     use std::collections::HashMap;
     use std::collections::HashSet;
-    use std::os::fd::AsRawFd;
     use crate::error::CompositorError;
     use crate::error::CompositorResult;
     use crate::card::Card;
     use crate::fourcc::FourCc;
     use crate::DRM_FORMAT;
-    use std::os::raw::c_void;
     pub const CURSOR_DIM: u32 = 64;
     fn is_plane_compatible_with_crtc(
         card: &Card,
@@ -85,225 +79,274 @@ mod buffer {
             .map_err(|err| { CompositorError::GbmCreation(err) })?;
         Ok(buffer)
     }
-    fn make_surfaces(
-        gbm: &gbm::Device<&'static Card>,
-        egl: &khregl::DynamicInstance<EGL1_5>,
-        config: &khregl::Config,
-        egldisplay: &khregl::Display,
-        planetype: PlaneType,
-        (width, height): (u32, u32),
-    ) -> CompositorResult<(gbm::Surface<&'static Card>, khregl::Surface)> {
-        let planeflag = match planetype {
-            PlaneType::Overlay | PlaneType::Primary => BufferObjectFlags::SCANOUT,
-            PlaneType::Cursor => BufferObjectFlags::CURSOR,
-        };
-        let gbmsurface = gbm
-            .create_surface::<
-                &'static Card,
-            >(width, height, DRM_FORMAT, planeflag | BufferObjectFlags::RENDERING)
-            .map_err(|e| CompositorError::GbmSurfaceCreate(e))?;
-        let eglsurface = unsafe {
-            egl.create_platform_window_surface(
-                *egldisplay,
-                *config,
-                gbmsurface.as_raw() as *mut c_void,
-                &[ATTRIB_NONE],
+    pub struct TripleBuffer {
+        pub draw: usize,
+        pub scan: usize,
+        pub bos: [gbm::BufferObject<()>; 3],
+        pub fbs: [framebuffer::Handle; 3],
+    }
+    #[automatically_derived]
+    impl ::core::fmt::Debug for TripleBuffer {
+        #[inline]
+        fn fmt(&self, f: &mut ::core::fmt::Formatter) -> ::core::fmt::Result {
+            ::core::fmt::Formatter::debug_struct_field4_finish(
+                f,
+                "TripleBuffer",
+                "draw",
+                &self.draw,
+                "scan",
+                &self.scan,
+                "bos",
+                &self.bos,
+                "fbs",
+                &&self.fbs,
             )
         }
-            .map_err(|e| CompositorError::EglSurfaceCreate(e))?;
-        Ok((gbmsurface, eglsurface))
+    }
+    impl TripleBuffer {
+        pub fn new(
+            card: &Card,
+            gbm: &gbm::Device<&Card>,
+            planetype: PlaneType,
+            size: (u32, u32),
+        ) -> CompositorResult<Self> {
+            let [a, b, c] = std::array::from_fn(|_| make_buffer(
+                card,
+                gbm,
+                planetype,
+                size,
+            ));
+            let buffers = [a?, b?, c?];
+            let [a, b, c] = std::array::from_fn(|i| {
+                card
+                    .add_framebuffer(&buffers[i], DRM_FORMAT.depth(), DRM_FORMAT.bpp())
+                    .map_err(|e| CompositorError::AddFrameBuffer(e))
+            });
+            let framebuffers = [a?, b?, c?];
+            Ok(Self {
+                scan: 0,
+                draw: 0,
+                bos: buffers,
+                fbs: framebuffers,
+            })
+        }
+        pub fn swap(&mut self) {
+            self.scan = self.draw;
+            self.draw = (self.draw + 1) % 3;
+        }
     }
     pub struct DrmCtx {
-        pub plane: Option<plane::Handle>,
+        pub plane: plane::Handle,
         pub plane_props: HashMap<String, property::Info>,
         pub size: (u32, u32),
-        pub current_bo: Option<gbm::BufferObject<&'static Card>>,
-        pub fbs: UnsafeCell<HashMap<i32, framebuffer::Handle>>,
-        pub gbmsurface: gbm::Surface<&'static Card>,
-        pub eglsurface: khregl::Surface,
+        pub buffers: TripleBuffer,
+    }
+    #[automatically_derived]
+    impl ::core::fmt::Debug for DrmCtx {
+        #[inline]
+        fn fmt(&self, f: &mut ::core::fmt::Formatter) -> ::core::fmt::Result {
+            ::core::fmt::Formatter::debug_struct_field4_finish(
+                f,
+                "DrmCtx",
+                "plane",
+                &self.plane,
+                "plane_props",
+                &self.plane_props,
+                "size",
+                &self.size,
+                "buffers",
+                &&self.buffers,
+            )
+        }
     }
     impl DrmCtx {
         pub fn new(
             card: &Card,
             gbm: &gbm::Device<&'static Card>,
-            egl: &khregl::DynamicInstance<EGL1_5>,
-            config: &khregl::Config,
-            egldisplay: &khregl::Display,
-            plane: Option<plane::Handle>,
+            plane: plane::Handle,
             planetype: PlaneType,
             size: (u32, u32),
-        ) -> CompositorResult<(Self, gbm::BufferObject<()>)> {
-            let (gbmsurface, eglsurface) = make_surfaces(
-                gbm,
-                egl,
-                config,
-                egldisplay,
-                planetype,
+        ) -> CompositorResult<Self> {
+            let plane_props = card
+                .get_properties(plane)
+                .map_err(|err| CompositorError::GetPlaneProperties(plane, err))?
+                .as_hashmap(card)
+                .map_err(|err| CompositorError::PropsToHashMap(err))?;
+            let buffers = TripleBuffer::new(card, gbm, planetype, size)?;
+            Ok(Self {
+                plane,
+                plane_props,
                 size,
-            )?;
-            let plane_props = if let Some(plane) = plane {
-                card.get_properties(plane)
-                    .map_err(|err| CompositorError::GetPlaneProperties(plane, err))?
-                    .as_hashmap(card)
-                    .map_err(|err| CompositorError::PropsToHashMap(err))?
-            } else {
-                HashMap::new()
-            };
-            let initial_buffer = make_buffer(card, gbm, planetype, size)?;
-            let fbs = HashMap::new();
-            Ok((
-                Self {
-                    plane,
-                    plane_props,
-                    size,
-                    current_bo: None,
-                    fbs: fbs.into(),
-                    gbmsurface,
-                    eglsurface,
-                },
-                initial_buffer,
-            ))
+                buffers,
+            })
         }
         pub fn from_connector(
             card: &Card,
             gbm: &gbm::Device<&'static Card>,
-            egl: &khregl::DynamicInstance<EGL1_5>,
-            config: &khregl::Config,
-            egldisplay: &khregl::Display,
             resources: &ResourceHandles,
             crtc: crtc::Handle,
             planes: &mut HashSet<plane::Handle>,
             planetype: PlaneType,
             size: (u32, u32),
-        ) -> CompositorResult<(Self, gbm::BufferObject<()>)> {
+        ) -> CompositorResult<Self> {
             let plane = find_compatible_plane(card, resources, crtc, planes, planetype);
             if let Some(plane) = plane {
-                let _ = planes.remove(&plane);
-            }
-            Self::new(card, gbm, egl, config, egldisplay, plane, planetype, size)
-        }
-        fn get_fb(
-            &self,
-            card: &Card,
-            bo: &gbm::BufferObject<&'static Card>,
-        ) -> CompositorResult<framebuffer::Handle> {
-            let fd = bo.fd().map_err(|e| CompositorError::GbmFd(e))?.as_raw_fd();
-            if let Some(fb) = unsafe { self.fbs.get().as_ref().unwrap().get(&fd) } {
-                Ok(*fb)
+                Self::new(card, gbm, plane, planetype, size)
             } else {
-                let fb = card
-                    .add_framebuffer(bo, DRM_FORMAT.depth(), DRM_FORMAT.bpp())
-                    .map_err(|err| CompositorError::AddFrameBuffer(err))?;
-                let fbs = (unsafe { &mut *self.fbs.get() })
-                    as &mut HashMap<i32, framebuffer::Handle>;
-                fbs.insert(fd, fb);
-                Ok(fb)
+                Err(
+                    CompositorError::NoCompatiblePrimaryPlane(
+                        card
+                            .get_crtc(crtc)
+                            .map_err(|e| CompositorError::GetCrtcInfo(crtc, e))?,
+                    ),
+                )
             }
+        }
+        fn get_draw_fb(&self) -> framebuffer::Handle {
+            self.buffers.fbs[self.buffers.draw]
         }
         pub fn init_req(
             &self,
-            card: &Card,
-            initial_fb: framebuffer::Handle,
             atomic_req: &mut atomic::AtomicModeReq,
             crtc: crtc::Handle,
         ) -> CompositorResult<()> {
-            if let Some(plane) = self.plane {
-                let props = &self.plane_props;
-                atomic_req
-                    .add_property(
-                        plane,
-                        props["FB_ID"].handle(),
-                        property::Value::Framebuffer(Some(initial_fb)),
-                    );
-                atomic_req
-                    .add_property(
-                        plane,
-                        props["CRTC_ID"].handle(),
-                        property::Value::CRTC(Some(crtc)),
-                    );
-                atomic_req
-                    .add_property(
-                        plane,
-                        props["SRC_X"].handle(),
-                        property::Value::UnsignedRange(0),
-                    );
-                atomic_req
-                    .add_property(
-                        plane,
-                        props["SRC_Y"].handle(),
-                        property::Value::UnsignedRange(0),
-                    );
-                atomic_req
-                    .add_property(
-                        plane,
-                        props["SRC_W"].handle(),
-                        property::Value::UnsignedRange((self.size.0 as u64) << 16),
-                    );
-                atomic_req
-                    .add_property(
-                        plane,
-                        props["SRC_H"].handle(),
-                        property::Value::UnsignedRange((self.size.1 as u64) << 16),
-                    );
-                atomic_req
-                    .add_property(
-                        plane,
-                        props["CRTC_X"].handle(),
-                        property::Value::SignedRange(0),
-                    );
-                atomic_req
-                    .add_property(
-                        plane,
-                        props["CRTC_Y"].handle(),
-                        property::Value::SignedRange(0),
-                    );
-                atomic_req
-                    .add_property(
-                        plane,
-                        props["CRTC_W"].handle(),
-                        property::Value::UnsignedRange(self.size.0 as u64),
-                    );
-                atomic_req
-                    .add_property(
-                        plane,
-                        props["CRTC_H"].handle(),
-                        property::Value::UnsignedRange(self.size.1 as u64),
-                    );
-            }
+            let plane = self.plane;
+            let props = &self.plane_props;
+            atomic_req
+                .add_property(
+                    plane,
+                    props["FB_ID"].handle(),
+                    property::Value::Framebuffer(Some(self.buffers.fbs[0])),
+                );
+            atomic_req
+                .add_property(
+                    plane,
+                    props["CRTC_ID"].handle(),
+                    property::Value::CRTC(Some(crtc)),
+                );
+            atomic_req
+                .add_property(
+                    plane,
+                    props["SRC_X"].handle(),
+                    property::Value::UnsignedRange(0),
+                );
+            atomic_req
+                .add_property(
+                    plane,
+                    props["SRC_Y"].handle(),
+                    property::Value::UnsignedRange(0),
+                );
+            atomic_req
+                .add_property(
+                    plane,
+                    props["SRC_W"].handle(),
+                    property::Value::UnsignedRange((self.size.0 as u64) << 16),
+                );
+            atomic_req
+                .add_property(
+                    plane,
+                    props["SRC_H"].handle(),
+                    property::Value::UnsignedRange((self.size.1 as u64) << 16),
+                );
+            atomic_req
+                .add_property(
+                    plane,
+                    props["CRTC_X"].handle(),
+                    property::Value::SignedRange(0),
+                );
+            atomic_req
+                .add_property(
+                    plane,
+                    props["CRTC_Y"].handle(),
+                    property::Value::SignedRange(0),
+                );
+            atomic_req
+                .add_property(
+                    plane,
+                    props["CRTC_W"].handle(),
+                    property::Value::UnsignedRange(self.size.0 as u64),
+                );
+            atomic_req
+                .add_property(
+                    plane,
+                    props["CRTC_H"].handle(),
+                    property::Value::UnsignedRange(self.size.1 as u64),
+                );
             Ok(())
         }
-        /// SAFETY: This function must be called exactly once after a page flip event, not
-        /// before
         pub unsafe fn swap(
             &mut self,
             card: &Card,
-            egl: &khregl::DynamicInstance<EGL1_5>,
-            display: &khregl::Display,
+            crtc: crtc::Handle,
         ) -> CompositorResult<()> {
-            if let Some(plane) = self.plane {
-                self.current_bo.take();
-                egl.swap_buffers(*display, self.eglsurface)
-                    .map_err(|e| CompositorError::BufferSwap(e))?;
-                let bo = unsafe {
-                    self.gbmsurface
-                        .lock_front_buffer()
-                        .map_err(|_| CompositorError::FrontBufferLock)?
-                };
-                let fb = self.get_fb(card, &bo)?;
-                let props = &self.plane_props;
-                let mut atomic_req = atomic::AtomicModeReq::new();
-                atomic_req
-                    .add_property(
-                        plane,
-                        props["FB_ID"].handle(),
-                        property::Value::Framebuffer(Some(fb)),
-                    );
-                card.atomic_commit(
-                        AtomicCommitFlags::NONBLOCK | AtomicCommitFlags::PAGE_FLIP_EVENT,
-                        atomic_req,
-                    )
-                    .map_err(|err| CompositorError::AtomicCommitFailed(err))?;
-            }
+            let plane = self.plane;
+            let mut atomic_req = atomic::AtomicModeReq::new();
+            atomic_req
+                .add_property(
+                    plane,
+                    self.plane_props["FB_ID"].handle(),
+                    property::Value::Framebuffer(Some(self.get_draw_fb())),
+                );
+            atomic_req
+                .add_property(
+                    plane,
+                    self.plane_props["CRTC_ID"].handle(),
+                    property::Value::CRTC(Some(crtc)),
+                );
+            atomic_req
+                .add_property(
+                    plane,
+                    self.plane_props["SRC_X"].handle(),
+                    property::Value::UnsignedRange(0),
+                );
+            atomic_req
+                .add_property(
+                    plane,
+                    self.plane_props["SRC_Y"].handle(),
+                    property::Value::UnsignedRange(0),
+                );
+            atomic_req
+                .add_property(
+                    plane,
+                    self.plane_props["SRC_W"].handle(),
+                    property::Value::UnsignedRange((self.size.0 << 16) as u64),
+                );
+            atomic_req
+                .add_property(
+                    plane,
+                    self.plane_props["SRC_H"].handle(),
+                    property::Value::UnsignedRange((self.size.1 << 16) as u64),
+                );
+            atomic_req
+                .add_property(
+                    plane,
+                    self.plane_props["CRTC_X"].handle(),
+                    property::Value::SignedRange(0),
+                );
+            atomic_req
+                .add_property(
+                    plane,
+                    self.plane_props["CRTC_Y"].handle(),
+                    property::Value::SignedRange(0),
+                );
+            atomic_req
+                .add_property(
+                    plane,
+                    self.plane_props["CRTC_W"].handle(),
+                    property::Value::UnsignedRange(self.size.0 as u64),
+                );
+            atomic_req
+                .add_property(
+                    plane,
+                    self.plane_props["CRTC_H"].handle(),
+                    property::Value::UnsignedRange(self.size.1 as u64),
+                );
+            card.atomic_commit(
+                    AtomicCommitFlags::NONBLOCK | AtomicCommitFlags::PAGE_FLIP_EVENT,
+                    atomic_req,
+                )
+                .map_err(|err| CompositorError::AtomicCommitFailed(err))?;
+            self.buffers.swap();
             Ok(())
         }
     }
@@ -454,15 +497,15 @@ mod config {
                                 static __CALLSITE: ::tracing::callsite::DefaultCallsite = {
                                     static META: ::tracing::Metadata<'static> = {
                                         ::tracing_core::metadata::Metadata::new(
-                                            "event compositor/src/config.rs:54",
-                                            "compositor::config",
+                                            "event dreampipe/src/config.rs:54",
+                                            "dreampipe::config",
                                             ::tracing::Level::WARN,
                                             ::tracing_core::__macro_support::Option::Some(
-                                                "compositor/src/config.rs",
+                                                "dreampipe/src/config.rs",
                                             ),
                                             ::tracing_core::__macro_support::Option::Some(54u32),
                                             ::tracing_core::__macro_support::Option::Some(
-                                                "compositor::config",
+                                                "dreampipe::config",
                                             ),
                                             ::tracing_core::field::FieldSet::new(
                                                 &["message"],
@@ -543,15 +586,15 @@ mod config {
                             static __CALLSITE: ::tracing::callsite::DefaultCallsite = {
                                 static META: ::tracing::Metadata<'static> = {
                                     ::tracing_core::metadata::Metadata::new(
-                                        "event compositor/src/config.rs:82",
-                                        "compositor::config",
+                                        "event dreampipe/src/config.rs:82",
+                                        "dreampipe::config",
                                         ::tracing::Level::ERROR,
                                         ::tracing_core::__macro_support::Option::Some(
-                                            "compositor/src/config.rs",
+                                            "dreampipe/src/config.rs",
                                         ),
                                         ::tracing_core::__macro_support::Option::Some(82u32),
                                         ::tracing_core::__macro_support::Option::Some(
-                                            "compositor::config",
+                                            "dreampipe::config",
                                         ),
                                         ::tracing_core::field::FieldSet::new(
                                             &["message"],
@@ -618,12 +661,10 @@ mod display {
     use drm::control;
     use drm::control::atomic;
     use drm::control::crtc;
-    use drm::control::framebuffer;
     use drm::control::plane;
     use drm::control::property;
     pub use drm::control::Device as ControlDevice;
     use drm::control::PlaneType;
-    use khregl::EGL1_5;
     use std::collections::HashMap;
     use std::collections::HashSet;
     use drm::control::connector;
@@ -634,9 +675,6 @@ mod display {
     use crate::error::CompositorError;
     use crate::error::CompositorResult;
     use crate::card::Card;
-    use crate::util::Bounds2;
-    use crate::util::Point2;
-    use crate::util::Vec2;
     #[allow(unused)]
     fn print_formats(card: &Card, plane: plane::Handle) {
         let prop_vals: HashMap<property::Handle, u64> = card
@@ -651,10 +689,11 @@ mod display {
             ::std::io::_print(format_args!("formats: {0:?}\n", blob.as_slice()));
         };
     }
+    #[repr(C)]
     pub struct Display {
-        name: String,
-        pub size: Vec2,
-        pub pos: Point2,
+        pub name: String,
+        pub size: (u32, u32),
+        pub pos: (i32, i32),
         pub connector: connector::Handle,
         pub crtc: crtc::Handle,
         pub connector_props: HashMap<String, property::Info>,
@@ -663,6 +702,102 @@ mod display {
         pub primary: DrmCtx,
         pub cursor: DrmCtx,
         pub overlays: Vec<DrmCtx>,
+    }
+    #[automatically_derived]
+    impl ::core::fmt::Debug for Display {
+        #[inline]
+        fn fmt(&self, f: &mut ::core::fmt::Formatter) -> ::core::fmt::Result {
+            let names: &'static _ = &[
+                "name",
+                "size",
+                "pos",
+                "connector",
+                "crtc",
+                "connector_props",
+                "crtc_props",
+                "mode",
+                "primary",
+                "cursor",
+                "overlays",
+            ];
+            let values: &[&dyn ::core::fmt::Debug] = &[
+                &self.name,
+                &self.size,
+                &self.pos,
+                &self.connector,
+                &self.crtc,
+                &self.connector_props,
+                &self.crtc_props,
+                &self.mode,
+                &self.primary,
+                &self.cursor,
+                &&self.overlays,
+            ];
+            ::core::fmt::Formatter::debug_struct_fields_finish(
+                f,
+                "Display",
+                names,
+                values,
+            )
+        }
+    }
+    #[repr(C)]
+    pub struct ReadonlyDisplay {
+        name: String,
+        pub size: (u32, u32),
+        pub pos: (i32, i32),
+        pub connector: connector::Handle,
+        pub crtc: crtc::Handle,
+        pub connector_props: HashMap<String, property::Info>,
+        pub crtc_props: HashMap<String, property::Info>,
+        pub mode: control::Mode,
+        pub primary: DrmCtx,
+        pub cursor: DrmCtx,
+        pub overlays: Vec<DrmCtx>,
+    }
+    #[automatically_derived]
+    impl ::core::fmt::Debug for ReadonlyDisplay {
+        #[inline]
+        fn fmt(&self, f: &mut ::core::fmt::Formatter) -> ::core::fmt::Result {
+            let names: &'static _ = &[
+                "name",
+                "size",
+                "pos",
+                "connector",
+                "crtc",
+                "connector_props",
+                "crtc_props",
+                "mode",
+                "primary",
+                "cursor",
+                "overlays",
+            ];
+            let values: &[&dyn ::core::fmt::Debug] = &[
+                &self.name,
+                &self.size,
+                &self.pos,
+                &self.connector,
+                &self.crtc,
+                &self.connector_props,
+                &self.crtc_props,
+                &self.mode,
+                &self.primary,
+                &self.cursor,
+                &&self.overlays,
+            ];
+            ::core::fmt::Formatter::debug_struct_fields_finish(
+                f,
+                "ReadonlyDisplay",
+                names,
+                values,
+            )
+        }
+    }
+    impl core::ops::Deref for Display {
+        type Target = ReadonlyDisplay;
+        fn deref(&self) -> &Self::Target {
+            unsafe { &*(self as *const Self as *const Self::Target) }
+        }
     }
     impl std::hash::Hash for Display {
         fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
@@ -676,16 +811,9 @@ mod display {
         }
     }
     impl Display {
-        pub fn name(&self) -> &str {
-            &self.name
-        }
-        pub fn bounds(&self) -> Bounds2 {
-            Bounds2::new(self.pos.into(), Point2::from(self.pos) + Vec2::from(self.size))
-        }
         pub fn init_req(
             &self,
             card: &Card,
-            initial_fb: framebuffer::Handle,
             atomic_req: &mut atomic::AtomicModeReq,
         ) -> CompositorResult<()> {
             atomic_req
@@ -705,124 +833,102 @@ mod display {
                     self.crtc_props["ACTIVE"].handle(),
                     property::Value::Boolean(true),
                 );
-            self.primary.init_req(card, initial_fb, atomic_req, self.crtc)?;
-            self.cursor.init_req(card, initial_fb, atomic_req, self.crtc)?;
-            for overlay in self.overlays.iter() {
-                overlay.init_req(card, initial_fb, atomic_req, self.crtc)?;
-            }
             Ok(())
         }
-    }
-    pub fn init_displays(
-        ignore_list: impl Into<Option<HashSet<String>>>,
-        card: &Card,
-        gbm: &gbm::Device<&'static Card>,
-        egl: &khregl::DynamicInstance<EGL1_5>,
-        egldisplay: &khregl::Display,
-        config: &khregl::Config,
-    ) -> CompositorResult<Vec<(Display, gbm::BufferObject<()>, gbm::BufferObject<()>)>> {
-        let ignore_list = ignore_list.into();
-        for (cap, enable) in [
-            (ClientCapability::UniversalPlanes, true),
-            (ClientCapability::Atomic, true),
-        ]
-            .into_iter()
-        {
-            card.set_client_capability(cap, enable)
-                .map_err(|err| { CompositorError::ClientCapability(cap, err) })?;
-        }
-        let resources = card
-            .resource_handles()
-            .map_err(|err| { CompositorError::ResourcesError(err) })?;
-        {
-            ::std::io::_print(format_args!("Getting all connected connectors\n"));
-        };
-        let connected: Vec<connector::Info> = resources
-            .connectors()
-            .iter()
-            .flat_map(|con| card.get_connector(*con, true))
-            .filter(|i| {
-                i.state() == connector::State::Connected && !i.modes().is_empty()
-            })
-            .collect();
-        if connected.is_empty() {
-            Err(CompositorError::NoQualifiedConnectors)?;
-        }
-        let mut planes: HashSet<plane::Handle> = card
-            .plane_handles()
-            .map_err(|err| CompositorError::GetPlanes(err))?
-            .into_iter()
-            .collect();
-        {
-            ::std::io::_print(format_args!("Organizing the display objects.\n"));
-        };
-        let max_displays = resources.crtcs().len().min(connected.len());
-        let mut displays = Vec::new();
-        for (connector, &crtc) in connected
-            .into_iter()
-            .take(max_displays)
-            .zip(resources.crtcs())
-        {
-            let name = ::alloc::__export::must_use({
-                ::alloc::fmt::format(
-                    format_args!(
-                        "card{0}-{1}-{2}",
-                        card.num(),
-                        connector.interface().as_str(),
-                        connector.interface_id(),
-                    ),
-                )
-            });
-            if let Some(ref ignore_list) = ignore_list {
-                if ignore_list.contains(&name) {
-                    continue;
-                }
+        pub fn init_displays(
+            ignore_list: impl Into<Option<HashSet<String>>>,
+            card: &Card,
+            gbm: &gbm::Device<&'static Card>,
+        ) -> CompositorResult<Vec<Display>> {
+            let ignore_list = ignore_list.into();
+            for (cap, enable) in [
+                (ClientCapability::UniversalPlanes, true),
+                (ClientCapability::Atomic, true),
+            ]
+                .into_iter()
+            {
+                card.set_client_capability(cap, enable)
+                    .map_err(|err| { CompositorError::ClientCapability(cap, err) })?;
             }
-            let mode = *connector.modes().first().unwrap();
-            let size = match mode.size() {
-                (width, height) => (width as i32, height as i32),
-            };
-            let (primary, initial_primary_bo) = DrmCtx::from_connector(
-                card,
-                gbm,
-                egl,
-                config,
-                egldisplay,
-                &resources,
-                crtc,
-                &mut planes,
-                PlaneType::Primary,
-                (size.0 as u32, size.1 as u32),
-            )?;
-            let (cursor, initial_cursor_bo) = DrmCtx::from_connector(
-                card,
-                gbm,
-                egl,
-                config,
-                egldisplay,
-                &resources,
-                crtc,
-                &mut planes,
-                PlaneType::Cursor,
-                (CURSOR_DIM, CURSOR_DIM),
-            )?;
-            let connector_props = card
-                .get_properties(connector.handle())
-                .map_err(|err| CompositorError::GetConnectorProperties(
-                    connector.handle(),
-                    err,
-                ))?
-                .as_hashmap(card)
-                .map_err(|err| CompositorError::PropsToHashMap(err))?;
-            let crtc_props = card
-                .get_properties(crtc)
-                .map_err(|err| CompositorError::GetCrtcProperties(crtc, err))?
-                .as_hashmap(card)
-                .map_err(|err| CompositorError::PropsToHashMap(err))?;
-            let size = size.into();
-            displays
-                .push((
-                    Display {
+            let resources = card
+                .resource_handles()
+                .map_err(|err| { CompositorError::ResourcesError(err) })?;
+            let connected: Vec<connector::Info> = resources
+                .connectors()
+                .iter()
+                .flat_map(|con| card.get_connector(*con, true))
+                .filter(|i| {
+                    i.state() == connector::State::Connected && !i.modes().is_empty()
+                })
+                .collect();
+            if connected.is_empty() {
+                Err(CompositorError::NoQualifiedConnectors)?;
+            }
+            let mut planes: HashSet<plane::Handle> = card
+                .plane_handles()
+                .map_err(|err| CompositorError::GetPlanes(err))?
+                .into_iter()
+                .collect();
+            let max_displays = resources.crtcs().len().min(connected.len());
+            let mut displays = Vec::new();
+            for (connector, &crtc) in connected
+                .into_iter()
+                .take(max_displays)
+                .zip(resources.crtcs())
+            {
+                let name = ::alloc::__export::must_use({
+                    ::alloc::fmt::format(
+                        format_args!(
+                            "card{0}-{1}-{2}",
+                            card.num(),
+                            connector.interface().as_str(),
+                            connector.interface_id(),
+                        ),
+                    )
+                });
+                if let Some(ref ignore_list) = ignore_list {
+                    if ignore_list.contains(&name) {
+                        continue;
+                    }
+                }
+                let mode = *connector.modes().first().unwrap();
+                let size = match mode.size() {
+                    (width, height) => (width as u32, height as u32),
+                };
+                let primary = DrmCtx::from_connector(
+                    card,
+                    gbm,
+                    &resources,
+                    crtc,
+                    &mut planes,
+                    PlaneType::Primary,
+                    (size.0, size.1),
+                )?;
+                let cursor = DrmCtx::from_connector(
+                    card,
+                    gbm,
+                    &resources,
+                    crtc,
+                    &mut planes,
+                    PlaneType::Cursor,
+                    (CURSOR_DIM, CURSOR_DIM),
+                )?;
+                let connector_props = card
+                    .get_properties(connector.handle())
+                    .map_err(|err| CompositorError::GetConnectorProperties(
+                        connector.handle(),
+                        err,
+                    ))?
+                    .as_hashmap(card)
+                    .map_err(|err| CompositorError::PropsToHashMap(err))?;
+                let crtc_props = card
+                    .get_properties(crtc)
+                    .map_err(|err| CompositorError::GetCrtcProperties(crtc, err))?
+                    .as_hashmap(card)
+                    .map_err(|err| CompositorError::PropsToHashMap(err))?;
+                let size = size.into();
+                displays
+                    .push(Display {
                         name,
                         size,
                         pos: Default::default(),
@@ -834,12 +940,10 @@ mod display {
                         primary,
                         cursor,
                         overlays: ::alloc::vec::Vec::new(),
-                    },
-                    initial_primary_bo,
-                    initial_cursor_bo,
-                ));
+                    });
+            }
+            Ok(displays)
         }
-        Ok(displays)
     }
 }
 mod error {
@@ -857,6 +961,7 @@ mod error {
     pub type CompositorResult<T> = std::result::Result<T, CompositorError>;
     pub enum CompositorError {
         OpenCard(PathBuf, IoError),
+        GpuCard,
         ClientCapability(ClientCapability, IoError),
         ResourcesError(IoError),
         NoQualifiedConnectors,
@@ -864,8 +969,6 @@ mod error {
         GbmFd(InvalidFdError),
         GbmSurfaceCreate(IoError),
         FrontBufferLock,
-        BufferSwap(khregl::Error),
-        EglSurfaceCreate(khregl::Error),
         AddFrameBuffer(IoError),
         GetPlanes(IoError),
         NoCompatiblePrimaryPlane(crtc::Info),
@@ -896,6 +999,9 @@ mod error {
                         __self_0,
                         &__self_1,
                     )
+                }
+                CompositorError::GpuCard => {
+                    ::core::fmt::Formatter::write_str(f, "GpuCard")
                 }
                 CompositorError::ClientCapability(__self_0, __self_1) => {
                     ::core::fmt::Formatter::debug_tuple_field2_finish(
@@ -938,20 +1044,6 @@ mod error {
                 }
                 CompositorError::FrontBufferLock => {
                     ::core::fmt::Formatter::write_str(f, "FrontBufferLock")
-                }
-                CompositorError::BufferSwap(__self_0) => {
-                    ::core::fmt::Formatter::debug_tuple_field1_finish(
-                        f,
-                        "BufferSwap",
-                        &__self_0,
-                    )
-                }
-                CompositorError::EglSurfaceCreate(__self_0) => {
-                    ::core::fmt::Formatter::debug_tuple_field1_finish(
-                        f,
-                        "EglSurfaceCreate",
-                        &__self_0,
-                    )
                 }
                 CompositorError::AddFrameBuffer(__self_0) => {
                     ::core::fmt::Formatter::debug_tuple_field1_finish(
@@ -1096,6 +1188,13 @@ mod error {
                         )
                     })
                 }
+                Self::GpuCard => {
+                    ::alloc::__export::must_use({
+                        ::alloc::fmt::format(
+                            format_args!("No matching card for selected GPU"),
+                        )
+                    })
+                }
                 Self::ClientCapability(client_capability, error) => {
                     ::alloc::__export::must_use({
                         ::alloc::fmt::format(
@@ -1149,20 +1248,6 @@ mod error {
                 Self::FrontBufferLock => {
                     ::alloc::__export::must_use({
                         ::alloc::fmt::format(format_args!("Failed to lock front buffer"))
-                    })
-                }
-                Self::BufferSwap(error) => {
-                    ::alloc::__export::must_use({
-                        ::alloc::fmt::format(
-                            format_args!("Failed to swap buffers: {0:#?}", error),
-                        )
-                    })
-                }
-                Self::EglSurfaceCreate(error) => {
-                    ::alloc::__export::must_use({
-                        ::alloc::fmt::format(
-                            format_args!("Failed to create EGL surface: {0:#?}", error),
-                        )
                     })
                 }
                 Self::AddFrameBuffer(error) => {
@@ -1535,415 +1620,19 @@ mod fourcc {
         }
     }
 }
-mod quadtree {
-    #![allow(dead_code)]
-    use std::cell::UnsafeCell;
-    use std::collections::HashSet;
-    use std::{
-        collections::HashMap, convert::Infallible, hash::Hash, marker::PhantomData,
-    };
-    use crate::util::Point2;
-    use crate::util::Bounds2;
-    type Equality<T> = dyn Fn(&T, &T) -> bool + 'static;
-    enum Node<T> {
-        Leaf(usize),
-        Branch(Box<[Node<T>; 4]>),
-        __(Infallible, PhantomData<T>),
-    }
-    pub struct Quadtree<'a, T> {
-        register_left: HashMap<usize, UnsafeCell<T>>,
-        register_right: HashMap<&'a T, usize>,
-        next_id: usize,
-        bounds: Bounds2,
-        root: Node<T>,
-        _ref: PhantomData<&'a ()>,
-    }
-    /// `T` should be cheap to clone.
-    impl<T: Eq + Hash> Node<T> {
-        pub fn insert_with_ignore<'a, F: Fn(&'a T) -> bool + 'a>(
-            &mut self,
-            register: &'a HashMap<usize, UnsafeCell<T>>,
-            id: usize,
-            node_bounds: Bounds2,
-            area_rect: Bounds2,
-            ignore: Option<&F>,
-        ) {
-            let p = node_bounds.points();
-            let q = node_bounds.quarters();
-            match self {
-                Node::Leaf(nid) => {
-                    if *nid == id {
-                        return;
-                    }
-                    if let Some(ignore) = ignore {
-                        if ignore(unsafe {
-                            (register.get(&nid).unwrap().get()).as_ref().unwrap()
-                        }) {
-                            return;
-                        }
-                    }
-                    if p.iter().all(|p| area_rect.contains(*p)) {
-                        *self = Node::Leaf(id);
-                        return;
-                    }
-                    let mut children = std::array::from_fn::<
-                        _,
-                        4,
-                        _,
-                    >(|_| Node::Leaf(nid.clone()));
-                    for (node, quadrant) in children.iter_mut().zip(q) {
-                        if let Some(_bounds) = area_rect.intersection(&quadrant) {
-                            node.insert_with_ignore(
-                                register,
-                                id,
-                                quadrant,
-                                area_rect,
-                                ignore,
-                            );
-                        }
-                    }
-                    *self = Self::Branch(Box::new(children));
-                }
-                Node::Branch(nodes) => {
-                    for (quadrant, node) in q.into_iter().zip(nodes.iter_mut()) {
-                        node.insert_with_ignore(
-                            register,
-                            id,
-                            quadrant,
-                            area_rect,
-                            ignore,
-                        );
-                    }
-                    if nodes
-                        .iter()
-                        .all(|node| {
-                            if let Node::Leaf(nid) = node { *nid == id } else { false }
-                        })
-                    {
-                        *self = Node::Leaf(id);
-                    }
-                }
-                Node::__(..) => {
-                    ::core::panicking::panic("internal error: entered unreachable code")
-                }
-            }
-        }
-        pub fn select<'a>(
-            &self,
-            register: &'a HashMap<usize, UnsafeCell<T>>,
-            node_bounds: Bounds2,
-            rect: Bounds2,
-            hopper: &mut HashMap<usize, Vec<Bounds2>>,
-        ) {
-            if let Some(new_bounds) = node_bounds.intersection(&rect) {
-                match self {
-                    Node::Leaf(nid) => {
-                        hopper.entry(*nid).or_default().push(new_bounds);
-                    }
-                    Node::Branch(children) => {
-                        let q = node_bounds.quarters();
-                        for (child, quadrant) in children.iter().zip(q) {
-                            child.select(register, quadrant, rect, hopper);
-                        }
-                    }
-                    _ => {
-                        ::core::panicking::panic(
-                            "internal error: entered unreachable code",
-                        )
-                    }
-                }
-            }
-        }
-        pub fn select_items<'a>(
-            &self,
-            register: &'a HashMap<usize, UnsafeCell<T>>,
-            node_bounds: Bounds2,
-            rect: Bounds2,
-            hopper: &mut HashSet<usize>,
-        ) {
-            if let Some(_) = node_bounds.intersection(&rect) {
-                match self {
-                    Node::Leaf(nid) => {
-                        hopper.insert(*nid);
-                    }
-                    Node::Branch(children) => {
-                        let q = node_bounds.quarters();
-                        for (child, quadrant) in children.iter().zip(q) {
-                            child.select_items(register, quadrant, rect, hopper);
-                        }
-                    }
-                    _ => {
-                        ::core::panicking::panic(
-                            "internal error: entered unreachable code",
-                        )
-                    }
-                }
-            }
-        }
-        pub fn select_mut<'a>(
-            &mut self,
-            register: &'a HashMap<usize, UnsafeCell<T>>,
-            node_bounds: Bounds2,
-            rect: Bounds2,
-            hopper: &mut HashMap<usize, Vec<Bounds2>>,
-        ) {
-            if let Some(new_bounds) = node_bounds.intersection(&rect) {
-                match self {
-                    Node::Leaf(nid) => {
-                        hopper.entry(*nid).or_default().push(new_bounds);
-                    }
-                    Node::Branch(children) => {
-                        let q = node_bounds.quarters();
-                        for (child, quadrant) in children.iter_mut().zip(q) {
-                            child.select_mut(register, quadrant, rect, hopper);
-                        }
-                    }
-                    _ => {
-                        ::core::panicking::panic(
-                            "internal error: entered unreachable code",
-                        )
-                    }
-                }
-            }
-        }
-    }
-    impl<'a, T: Eq + Hash> Quadtree<'a, T> {
-        pub fn new(bounds: Bounds2) -> Self {
-            let register_left = HashMap::new();
-            let register_right = HashMap::new();
-            Self {
-                register_left,
-                register_right,
-                next_id: 1,
-                bounds,
-                root: Node::Leaf(0),
-                _ref: PhantomData,
-            }
-        }
-        pub fn is_empty(&self) -> bool {
-            self.register_left.is_empty()
-        }
-        fn register(&mut self, val: T) -> usize {
-            if let Some(id) = self.register_right.get(&val) {
-                return *id;
-            }
-            self.register_left.insert(self.next_id, UnsafeCell::new(val));
-            let k = unsafe {
-                self.register_left.get(&self.next_id).unwrap().get().as_ref().unwrap()
-            };
-            self.register_right.insert(k, self.next_id);
-            let out = self.next_id;
-            self.next_id += 1;
-            out
-        }
-        pub fn insert<'b>(&'b mut self, area_rect: Bounds2, val: T) {
-            let id = { self.register(val) };
-            self.root
-                .insert_with_ignore::<
-                    Box<dyn Fn(&T) -> bool>,
-                >(&self.register_left, id, self.bounds, area_rect, None)
-        }
-        pub fn insert_with_ignore(
-            &mut self,
-            area_rect: Bounds2,
-            val: T,
-            ignore: Option<&(impl Fn(&T) -> bool + 'a)>,
-        ) {
-            let ignore = ignore.as_ref();
-            let id = self.register(val);
-            self.root
-                .insert_with_ignore(
-                    &self.register_left,
-                    id,
-                    self.bounds,
-                    area_rect,
-                    ignore,
-                )
-        }
-        /// Returns references to all values in the bounds
-        pub fn select(&self, rect: Bounds2) -> Vec<(&T, Vec<Bounds2>)> {
-            let mut regions = HashMap::new();
-            self.root.select(&self.register_left, self.bounds, rect, &mut regions);
-            let mut output = Vec::new();
-            for (k, b) in regions {
-                if let Some(t) = self.register_left.get(&k) {
-                    output.push((unsafe { t.get().as_ref().unwrap() }, b));
-                }
-            }
-            output
-        }
-        pub fn select_items(&self, rect: Bounds2) -> Vec<&T> {
-            let mut ids = HashSet::new();
-            self.root.select_items(&self.register_left, self.bounds, rect, &mut ids);
-            let mut output = Vec::new();
-            for k in ids {
-                if let Some(t) = self.register_left.get(&k) {
-                    output.push(unsafe { t.get().as_ref().unwrap() });
-                }
-            }
-            output
-        }
-        pub fn select_mut(
-            &'a mut self,
-            rect: Bounds2,
-        ) -> Vec<(&'a mut T, Vec<Bounds2>)> {
-            let mut regions = HashMap::new();
-            self.root
-                .select_mut(&mut self.register_left, self.bounds, rect, &mut regions);
-            let mut output = Vec::new();
-            let reg_ptr = (&mut self.register_left)
-                as *mut HashMap<usize, UnsafeCell<T>>;
-            for (k, r) in regions.into_iter() {
-                let v = unsafe { reg_ptr.as_mut().unwrap().get_mut(&k) };
-                output.push((v.unwrap().get_mut(), r));
-            }
-            output
-        }
-        pub fn select_all(&self) -> Vec<(&T, Vec<Bounds2>)> {
-            self.select(self.bounds)
-        }
-        pub fn select_all_items(&self) -> Vec<(usize, &T)> {
-            self.register_left
-                .iter()
-                .map(|(k, v)| (*k, unsafe { v.get().as_ref().unwrap() }))
-                .collect()
-        }
-        pub fn select_all_items_mut(&mut self) -> Vec<(usize, &mut T)> {
-            self.register_left.iter_mut().map(|(k, v)| (*k, v.get_mut())).collect()
-        }
-        /// Attempts to merge bounds that have the same width and height
-        pub fn select_merged(&self) -> Vec<(&T, Vec<Bounds2>)> {
-            let mut work = <[_]>::into_vec(
-                ::alloc::boxed::box_new([(self.bounds, &self.root)]),
-            );
-            let mut result = HashMap::<&T, Vec<Bounds2>>::new();
-            while !work.is_empty() {
-                let (bounds, node) = work.pop().unwrap();
-                match node {
-                    Node::Leaf(leaf_id) => {
-                        let Some(leaf) = self.register_left.get(leaf_id) else {
-                            {
-                                ::core::panicking::panic_fmt(
-                                    format_args!(
-                                        "internal error: entered unreachable code: {0}",
-                                        format_args!("This should never happen"),
-                                    ),
-                                );
-                            };
-                        };
-                        result
-                            .entry(unsafe { leaf.get().as_ref().unwrap() })
-                            .and_modify(|bounds_array| bounds_array.push(bounds))
-                            .or_insert(
-                                <[_]>::into_vec(::alloc::boxed::box_new([bounds])),
-                            );
-                    }
-                    Node::Branch(children) => {
-                        work.extend(
-                            bounds.quarters().iter().copied().zip(children.iter()).rev(),
-                        )
-                    }
-                    _ => {}
-                }
-            }
-            for (_, child) in &mut result {
-                if child.len() <= 1 {
-                    continue;
-                }
-                if child.len() == 4 {
-                    let mut min_x = 0;
-                    let mut max_x = 0;
-                    let mut min_y = 0;
-                    let mut max_y = 0;
-                    for bound in &*child {
-                        min_x = bound.min.x.min(min_x);
-                        max_x = bound.max.x.max(max_x);
-                        min_y = bound.min.y.min(min_y);
-                        max_y = bound.max.y.max(max_y);
-                    }
-                    let new_child = Bounds2::new(
-                        (min_x, min_y).into(),
-                        (max_x, max_y).into(),
-                    );
-                    child.clear();
-                    child.push(new_child);
-                }
-            }
-            result.into_iter().collect()
-        }
-        pub fn into_objects(self) -> Vec<T> {
-            self.register_left.into_values().map(|v| v.into_inner()).collect()
-        }
-        pub fn remove(&mut self, id: usize) -> Option<T> {
-            if let Some(v) = self.register_left.get(&id) {
-                self.root
-                    .insert_with_ignore(
-                        &self.register_left,
-                        0,
-                        self.bounds,
-                        self.bounds,
-                        Some(&|o| unsafe { o != v.get().as_ref().unwrap() }),
-                    );
-                self.register_right.remove(unsafe { v.get().as_ref().unwrap() });
-                Some(self.register_left.remove(&id).unwrap().into_inner())
-            } else {
-                None
-            }
-        }
-    }
-    trait Extra {
-        fn points(&self) -> [Point2; 4];
-        fn quarters(&self) -> [Bounds2; 4];
-    }
-    impl Extra for Bounds2 {
-        fn points(&self) -> [Point2; 4] {
-            [
-                self.min,
-                (self.min.x, self.max.y).into(),
-                self.max,
-                (self.max.x, self.min.y).into(),
-            ]
-        }
-        fn quarters(&self) -> [Bounds2; 4] {
-            let halfx = (self.min.x + self.max.x) / 2;
-            let halfy = (self.min.y + self.max.y) / 2;
-            [
-                Bounds2 {
-                    min: (self.min.x, self.min.y).into(),
-                    max: (halfx, halfy).into(),
-                },
-                Bounds2 {
-                    min: (halfx, self.min.y).into(),
-                    max: (self.max.x, halfy).into(),
-                },
-                Bounds2 {
-                    min: (self.min.x, halfy).into(),
-                    max: (halfx, self.max.y).into(),
-                },
-                Bounds2 {
-                    min: (halfx, halfy).into(),
-                    max: (self.max.x, self.max.y).into(),
-                },
-            ]
-        }
-    }
-}
 mod util {
-    use crate::config::CompositorConfig;
-    use crate::VIRTUAL_SCREEN_EXTENTS;
-    use crate::config::Config;
     use crate::display::Display;
-    use crate::quadtree::Quadtree;
-    use euclid::Box2D;
-    use euclid::Point2D;
-    use euclid::Vector2D;
-    use khregl::DynamicInstance;
-    use khregl::EGL1_5;
+    use std::collections::BTreeMap;
+    use std::collections::HashMap;
     use std::os::raw::c_void;
     use std::str::FromStr;
-    pub type Point2 = Point2D<i32, ()>;
-    pub type Vec2 = Vector2D<i32, ()>;
-    pub type Bounds2 = Box2D<i32, ()>;
+    use taffy::Dimension;
+    use taffy::Display as NodeDisplay;
+    use taffy::FlexDirection;
+    use taffy::NodeId;
+    use taffy::Size;
+    use taffy::Style;
+    use taffy::TaffyTree;
     pub struct DisplayPosition {
         x: u32,
         y: u32,
@@ -1998,11 +1687,6 @@ mod util {
             (value.x as i32, value.y as i32)
         }
     }
-    impl From<DisplayPosition> for Point2 {
-        fn from(value: DisplayPosition) -> Self {
-            <DisplayPosition as Into<(i32, i32)>>::into(value).into()
-        }
-    }
     pub enum Direction {
         East,
         South,
@@ -2027,198 +1711,537 @@ mod util {
             __self_discr == __arg1_discr
         }
     }
-    pub fn resolve_collisions(
-        output: &Quadtree<'_, Display>,
-        bounds: &mut euclid::Box2D<i32, ()>,
-    ) {
-        let mut moved: Option<Direction> = None;
-        loop {
-            let select = output.select_items(*bounds);
-            if select.is_empty() {
-                break;
-            }
-            for intheway in select.into_iter().map(|d| d.bounds()) {
-                let dleft = bounds.max.x - intheway.min.x;
-                let dright = intheway.max.x - bounds.min.x;
-                let dup = bounds.max.y - intheway.min.y;
-                let ddown = intheway.max.y - bounds.min.y;
-                let min = dleft.min(dright).min(dup).min(ddown);
-                match [min == dleft, min == dright, min == dup, min == ddown] {
-                    [true, ..] if moved != Some(Direction::East) => {
-                        moved = Some(Direction::West);
-                        *bounds = bounds.translate((-dleft, 0).into());
-                        continue;
-                    }
-                    [_, true, ..] if moved != Some(Direction::West) => {
-                        if (i32::MAX - bounds.size().width) < bounds.max.x {
-                            moved = Some(Direction::West);
-                            *bounds = bounds.translate((-dleft, 0).into());
-                            continue;
-                        }
-                        moved = Some(Direction::East);
-                        *bounds = bounds.translate((dright, 0).into());
-                        continue;
-                    }
-                    [_, _, true, ..] if moved != Some(Direction::South) => {
-                        moved = Some(Direction::North);
-                        *bounds = bounds.translate((0, dup).into());
-                        continue;
-                    }
-                    [_, _, _, true] if moved != Some(Direction::North) => {
-                        if (i32::MAX - bounds.size().height) < bounds.max.y {
-                            moved = Some(Direction::North);
-                            *bounds = bounds.translate((0, dup).into());
-                            continue;
-                        }
-                        moved = Some(Direction::South);
-                        *bounds = bounds.translate((0, -ddown).into());
-                        continue;
-                    }
-                    [..] => {}
-                }
-            }
-        }
-    }
-    pub fn arrange_displays<'a, 'b>(
-        displays: Vec<Display>,
-        config: &'a Config,
-    ) -> Quadtree<'b, Display> {
-        let mut arranging = Quadtree::new(
-            Bounds2::new((0, 0).into(), VIRTUAL_SCREEN_EXTENTS.into()),
-        );
-        if displays.is_empty() {
-            return arranging;
-        }
-        let mut leftover = Vec::new();
-        for mut display in displays.into_iter() {
-            if let Some(new_pos) = config
-                .get::<DisplayPosition>(&CompositorConfig::offset_key(&display.name()))
-            {
-                display.pos = new_pos.into();
-                let mut bounds = display.bounds();
-                resolve_collisions(&arranging, &mut bounds);
-                display.pos = bounds.min;
-                arranging.insert(bounds, display);
-            } else {
-                display.pos = (0, 0).into();
-                leftover.push(display);
-            }
-        }
-        for mut display in leftover.into_iter() {
-            let mut bounds = display.bounds();
-            resolve_collisions(&arranging, &mut bounds);
-            display.pos = bounds.min;
-            arranging.insert(bounds, display);
-        }
-        let mut min = Vec2::zero();
-        for (_, display) in arranging.select_all_items() {
-            min.x = min.x.min(display.pos.x);
-            min.y = min.y.min(display.pos.y);
-        }
-        let output = if min.x != 0 || min.y != 0 {
-            let displays = arranging.into_objects();
-            let mut displacing = Quadtree::new(
-                Bounds2::new((0, 0).into(), VIRTUAL_SCREEN_EXTENTS.into()),
-            );
-            for mut display in displays {
-                display.pos -= min;
-                displacing.insert(display.bounds(), display);
-            }
-            displacing
-        } else {
-            arranging
-        };
-        output
-    }
-    pub fn create_context(
-        egl: &khregl::DynamicInstance,
-        display: khregl::Display,
-    ) -> (khregl::Context, khregl::Config) {
-        let attributes = [
-            khregl::RED_SIZE,
-            8,
-            khregl::GREEN_SIZE,
-            8,
-            khregl::BLUE_SIZE,
-            8,
-            khregl::ALPHA_SIZE,
-            8,
-            khregl::SURFACE_TYPE,
-            khregl::WINDOW_BIT,
-            khregl::RENDERABLE_TYPE,
-            khregl::OPENGL_ES3_BIT,
-            khregl::NONE,
-        ];
-        let config = egl
-            .choose_first_config(display, &attributes)
-            .expect("unable to choose an EGL configuration")
-            .expect("no EGL configuration found");
-        let context_attributes = [khregl::CONTEXT_CLIENT_VERSION, 3, khregl::NONE];
-        let context = egl
-            .create_context(display, config, None, &context_attributes)
-            .expect("unable to create an EGL context");
-        (context, config)
-    }
     #[allow(non_snake_case)]
     pub struct GlFns {
         pub EGLImageTargetTexture2DOES: unsafe extern "system" fn(u32, *const c_void),
     }
-    impl GlFns {
-        pub fn load(egl: &DynamicInstance<EGL1_5>) -> GlFns {
-            GlFns {
-                EGLImageTargetTexture2DOES: unsafe {
-                    std::mem::transmute(
-                        egl.get_proc_address("glEGLImageTargetTexture2DOES").unwrap()
-                            as *const c_void,
-                    )
-                },
-            }
-        }
-    }
     #[allow(dead_code)]
     pub struct BackgroundImage {
         pub bo: gbm::BufferObject<()>,
-        pub egl_image: khregl::Image,
         pub tex_id: u32,
         pub fb_id: u32,
+        pub width: i32,
+        pub height: i32,
+    }
+    pub fn layout_displays(
+        mut displays: HashMap<String, &mut Display>,
+    ) -> (TaffyTree<String>, Vec<NodeId>) {
+        let mut sorted = BTreeMap::new();
+        for (_, display) in displays.iter() {
+            let pos: (i32, i32) = display.pos.into();
+            let key = (pos.1, pos.0);
+            sorted
+                .insert(
+                    key,
+                    (
+                        display.name.to_owned(),
+                        Size {
+                            width: Dimension::length(display.size.0 as f32),
+                            height: Dimension::length(display.size.1 as f32),
+                        },
+                    ),
+                );
+        }
+        let mut tree: TaffyTree<String> = TaffyTree::<String>::new();
+        let mut leafs = Vec::new();
+        let mut hnodes = Vec::new();
+        let mut vnodes = Vec::new();
+        let mut prev_y = 0;
+        for ((y, _), (name, size)) in sorted {
+            if y > prev_y {
+                let node = tree
+                    .new_with_children(
+                        Style {
+                            flex_direction: FlexDirection::Row,
+                            flex_grow: 0.0,
+                            flex_wrap: taffy::FlexWrap::NoWrap,
+                            flex_shrink: 0.0,
+                            ..Default::default()
+                        },
+                        &hnodes,
+                    )
+                    .unwrap();
+                vnodes.push(node);
+                leafs.extend(hnodes.drain(..));
+            }
+            prev_y = y;
+            hnodes
+                .push(
+                    tree
+                        .new_leaf_with_context(
+                            Style {
+                                display: NodeDisplay::Block,
+                                size,
+                                min_size: size,
+                                max_size: size,
+                                flex_grow: 0.0,
+                                flex_shrink: 0.0,
+                                ..Default::default()
+                            },
+                            name,
+                        )
+                        .unwrap(),
+                );
+        }
+        {
+            let node = tree
+                .new_with_children(
+                    Style {
+                        flex_direction: FlexDirection::Row,
+                        flex_grow: 0.0,
+                        flex_wrap: taffy::FlexWrap::NoWrap,
+                        flex_shrink: 0.0,
+                        ..Default::default()
+                    },
+                    &hnodes,
+                )
+                .unwrap();
+            vnodes.push(node);
+            leafs.extend(hnodes.drain(..));
+        }
+        let root_node = tree
+            .new_with_children(
+                Style {
+                    flex_direction: FlexDirection::Column,
+                    ..Default::default()
+                },
+                &vnodes,
+            )
+            .unwrap();
+        tree.compute_layout(root_node, Size::max_content()).unwrap();
+        for leaf in leafs.iter() {
+            let nym = tree.get_node_context(*leaf).unwrap();
+            let display = displays.get_mut(nym).unwrap();
+            let pos = tree.layout(*leaf).unwrap().location;
+            display.pos = (pos.x as i32, pos.y as i32);
+        }
+        (tree, leafs)
+    }
+}
+mod gpu {
+    use crate::config::CompositorConfig;
+    use crate::config::Config;
+    use crate::util::DisplayPosition;
+    use crate::card::Card;
+    use crate::display::Display;
+    use crate::error::CompositorResult;
+    use drm::control::AtomicCommitFlags;
+    use drm::control::Device as ControlDevice;
+    use drm::control::atomic;
+    use drm::control::connector;
+    use std::collections::HashSet;
+    use taffy::NodeId;
+    use taffy::TaffyTree;
+    use wgpu::TextureFormat;
+    const TEXTURE_FORMAT: TextureFormat = TextureFormat::Rgba8Uint;
+    const BLIT_SHADER: &str = r#"struct VertexOutput {
+   @builtin(position) position: vec4<f32>,
+   @location(0) tex_coords: vec2<f32>,
+}
+@vertex
+fn vs_main(@builtin(vertex_index) vertex_index: u32) -> VertexOutput {
+   var out: VertexOutput;
+   let x = f32((vertex_index & 1u) << 2u) - 1.0;
+   let x = f32((vertex_index & 2u) << 1u) - 1.0;
+   out.position = vec4<f32>(x, y, 0.0, 1.0);
+   out.tex_coords = vec2<f32>(x + 1.0, 1.0 - y) * 0.5;
+   return out;
+}
+@group(0) @binding(0) var tex: texture_2d<f32>;
+@group(0) @binding(1) var tex_sampler: sampler;
+@fragment
+fn fs_main(in: VertexOutput) -> @location(0) vec4<32> {
+   return textureSample(tex, tex_sampler, in.tex_coords);
+}"#;
+    fn get_pci_ids_from_card(card_num: u32) -> Option<(u32, u32)> {
+        let sys_path = ::alloc::__export::must_use({
+            ::alloc::fmt::format(format_args!("/sys/class/drm/card{0}/device", card_num))
+        });
+        let vendor = std::fs::read_to_string(
+                ::alloc::__export::must_use({
+                    ::alloc::fmt::format(format_args!("{0}/vendor", sys_path))
+                }),
+            )
+            .ok()?;
+        let device = std::fs::read_to_string(
+                ::alloc::__export::must_use({
+                    ::alloc::fmt::format(format_args!("{0}/device", sys_path))
+                }),
+            )
+            .ok()?;
+        let vendor_id = u32::from_str_radix(vendor.trim().trim_start_matches("0x"), 16)
+            .ok()?;
+        let device_id = u32::from_str_radix(device.trim().trim_start_matches("0x"), 16)
+            .ok()?;
+        Some((vendor_id, device_id))
+    }
+    pub async fn init_gpu(
+        card: &Card,
+    ) -> CompositorResult<(wgpu::Adapter, wgpu::Device, wgpu::Queue)> {
+        let card_num = card.num();
+        if let Some((vendor_id, device_id)) = get_pci_ids_from_card(card_num) {
+            {
+                ::std::io::_print(
+                    format_args!(
+                        "Opend card{0}: vendor=0x{1:x}, device=0x{2:x}\n",
+                        card_num,
+                        vendor_id,
+                        device_id,
+                    ),
+                );
+            };
+        }
+        let instance = wgpu::Instance::new(
+            &wgpu::InstanceDescriptor {
+                backends: wgpu::Backends::VULKAN,
+                ..Default::default()
+            },
+        );
+        let adapters = instance.enumerate_adapters(wgpu::Backends::all());
+        {
+            ::std::io::_print(format_args!("Available GPUs:\n"));
+        };
+        for (i, adapter) in adapters.iter().enumerate() {
+            let info = adapter.get_info();
+            {
+                ::std::io::_print(
+                    format_args!(
+                        "  [{3}] {0} - {1:?} (Backend: {2:?})\n",
+                        info.name,
+                        info.device_type,
+                        info.backend,
+                        i,
+                    ),
+                );
+            };
+        }
+        let adapter = adapters
+            .clone()
+            .into_iter()
+            .find(|a| a.get_info().device_type == wgpu::DeviceType::DiscreteGpu)
+            .or_else(|| adapters.into_iter().next())
+            .expect("No suitable adapter found");
+        let info = adapter.get_info();
+        {
+            ::std::io::_print(
+                format_args!("Selected GPU {0} ({1:?})\n", info.name, info.backend),
+            );
+        };
+        let (device, queue) = adapter
+            .request_device(
+                &wgpu::DeviceDescriptor {
+                    label: Some("DMA-BUF Device"),
+                    required_features: wgpu::Features::empty(),
+                    required_limits: wgpu::Limits::defaults(),
+                    memory_hints: wgpu::MemoryHints::default(),
+                    experimental_features: wgpu::ExperimentalFeatures::disabled(),
+                    trace: wgpu::Trace::Off,
+                },
+            )
+            .await
+            .expect("Failed to create device");
+        {
+            ::std::io::_print(
+                format_args!("Card and GPU successfully initialized in tandem.\n"),
+            );
+        };
+        Ok((adapter, device, queue))
+    }
+    pub fn create_pipeline(device: &wgpu::Device) {
+        let mut encoder = device
+            .create_command_encoder(
+                &wgpu::CommandEncoderDescriptor {
+                    label: Some("Compositor Render Encoder"),
+                },
+            );
+        let shader = device
+            .create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("Blit Shader"),
+                source: wgpu::ShaderSource::Wgsl(BLIT_SHADER.into()),
+            });
+        let pipeline = device
+            .create_render_pipeline(
+                &wgpu::RenderPipelineDescriptor {
+                    label: Some("Blit Pipeline"),
+                    layout: None,
+                    vertex: wgpu::VertexState {
+                        module: &shader,
+                        entry_point: Some("vs_main"),
+                        buffers: &[],
+                        compilation_options: wgpu::PipelineCompilationOptions::default(),
+                    },
+                    fragment: Some(wgpu::FragmentState {
+                        module: &shader,
+                        entry_point: Some("fs_main"),
+                        targets: &[
+                            Some(wgpu::ColorTargetState {
+                                format: TEXTURE_FORMAT,
+                                blend: None,
+                                write_mask: wgpu::ColorWrites::ALL,
+                            }),
+                        ],
+                        compilation_options: wgpu::PipelineCompilationOptions::default(),
+                    }),
+                    primitive: wgpu::PrimitiveState::default(),
+                    depth_stencil: None,
+                    multisample: wgpu::MultisampleState::default(),
+                    multiview: None,
+                    cache: None,
+                },
+            );
+    }
+    pub struct GpuContext {
+        pub card: Box<Card>,
+        pub gbm: gbm::Device<&'static Card>,
+        pub displays: Vec<Display>,
+    }
+    impl GpuContext {
+        pub fn update(&mut self) {
+            let events = match self.card.receive_events() {
+                Ok(events) => {
+                    {
+                        ::std::io::_print(format_args!("Ready to receive events!\n"));
+                    };
+                    events.peekable()
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    {
+                        ::std::io::_print(format_args!("Would block\n"));
+                    };
+                    return;
+                }
+                Err(e) => {
+                    ::core::panicking::panic_fmt(format_args!("{0}", e));
+                }
+            };
+            events
+                .for_each(|event| {
+                    match event {
+                        drm::control::Event::PageFlip(event) => {
+                            {
+                                ::std::io::_print(format_args!("Got page flip event\n"));
+                            };
+                            let mut to_remove: HashSet<String> = HashSet::new();
+                            for display in self.displays.iter_mut() {
+                                if display.crtc != event.crtc {
+                                    continue;
+                                }
+                                {
+                                    ::std::io::_print(
+                                        format_args!(
+                                            "Blitting to the framebuffer for {0}\n",
+                                            display.name,
+                                        ),
+                                    );
+                                };
+                                match unsafe {
+                                    display.primary.swap(&self.card, display.crtc)
+                                } {
+                                    Ok(()) => {}
+                                    Err(e) => {
+                                        if let Ok(info) = self
+                                            .card
+                                            .get_connector(display.connector, false)
+                                        {
+                                            {
+                                                ::std::io::_print(format_args!("Got an error: {0}\n", e));
+                                            };
+                                            if info.state() != connector::State::Connected {
+                                                to_remove.insert(display.name.to_owned());
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            self.displays
+                                .retain_mut(|display| {
+                                    if to_remove.contains(&display.name) {
+                                        for fb in display
+                                            .primary
+                                            .buffers
+                                            .fbs
+                                            .iter()
+                                            .chain(display.cursor.buffers.fbs.iter())
+                                        {
+                                            self.card.destroy_framebuffer(*fb).ok();
+                                        }
+                                        for overlay in display.overlays.iter() {
+                                            for fb in overlay.buffers.fbs.iter() {
+                                                self.card.destroy_framebuffer(*fb).ok();
+                                            }
+                                        }
+                                        true
+                                    } else {
+                                        false
+                                    }
+                                });
+                        }
+                        _ => {}
+                    }
+                });
+        }
+        pub fn displays_mut(&mut self) -> impl Iterator<Item = &mut Display> {
+            self.displays.iter_mut()
+        }
+        /// Returns true if any new displays were acquired
+        pub fn init_displays(&mut self, config: &Config) -> bool {
+            let ignore_list = HashSet::<
+                String,
+            >::from_iter(self.displays.iter().map(|display| display.name.to_owned()));
+            let mut new_displays = Display::init_displays(
+                    ignore_list,
+                    &self.card,
+                    &self.gbm,
+                )
+                .unwrap_or_else(|e| {
+                    {
+                        use ::tracing::__macro_support::Callsite as _;
+                        static __CALLSITE: ::tracing::callsite::DefaultCallsite = {
+                            static META: ::tracing::Metadata<'static> = {
+                                ::tracing_core::metadata::Metadata::new(
+                                    "event dreampipe/src/gpu.rs:243",
+                                    "dreampipe::gpu",
+                                    ::tracing::Level::WARN,
+                                    ::tracing_core::__macro_support::Option::Some(
+                                        "dreampipe/src/gpu.rs",
+                                    ),
+                                    ::tracing_core::__macro_support::Option::Some(243u32),
+                                    ::tracing_core::__macro_support::Option::Some(
+                                        "dreampipe::gpu",
+                                    ),
+                                    ::tracing_core::field::FieldSet::new(
+                                        &["message"],
+                                        ::tracing_core::callsite::Identifier(&__CALLSITE),
+                                    ),
+                                    ::tracing::metadata::Kind::EVENT,
+                                )
+                            };
+                            ::tracing::callsite::DefaultCallsite::new(&META)
+                        };
+                        let enabled = ::tracing::Level::WARN
+                            <= ::tracing::level_filters::STATIC_MAX_LEVEL
+                            && ::tracing::Level::WARN
+                                <= ::tracing::level_filters::LevelFilter::current()
+                            && {
+                                let interest = __CALLSITE.interest();
+                                !interest.is_never()
+                                    && ::tracing::__macro_support::__is_enabled(
+                                        __CALLSITE.metadata(),
+                                        interest,
+                                    )
+                            };
+                        if enabled {
+                            (|value_set: ::tracing::field::ValueSet| {
+                                let meta = __CALLSITE.metadata();
+                                ::tracing::Event::dispatch(meta, &value_set);
+                            })({
+                                #[allow(unused_imports)]
+                                use ::tracing::field::{debug, display, Value};
+                                let mut iter = __CALLSITE.metadata().fields().iter();
+                                __CALLSITE
+                                    .metadata()
+                                    .fields()
+                                    .value_set(
+                                        &[
+                                            (
+                                                &::tracing::__macro_support::Iterator::next(&mut iter)
+                                                    .expect("FieldSet corrupted (this is a bug)"),
+                                                ::tracing::__macro_support::Option::Some(
+                                                    &format_args!("Failed to init displays: {0}", e)
+                                                        as &dyn Value,
+                                                ),
+                                            ),
+                                        ],
+                                    )
+                            });
+                        } else {
+                        }
+                    };
+                    Default::default()
+                });
+            if !new_displays.is_empty() {
+                for display in new_displays.iter() {
+                    {
+                        ::std::io::_print(
+                            format_args!(
+                                "Found display: {0} {1:?}\n",
+                                display.name,
+                                display.size,
+                            ),
+                        );
+                    };
+                }
+            }
+            for display in new_displays.iter_mut() {
+                let mut atomic_req = atomic::AtomicModeReq::new();
+                display
+                    .init_req(self.card.as_ref(), &mut atomic_req)
+                    .expect("Failed to init display");
+                display
+                    .primary
+                    .init_req(&mut atomic_req, display.crtc)
+                    .expect("Failed to init primary surface");
+                display
+                    .cursor
+                    .init_req(&mut atomic_req, display.crtc)
+                    .expect("Failed to init primary surface");
+                for overlay in display.overlays.iter() {
+                    overlay
+                        .init_req(&mut atomic_req, display.crtc)
+                        .expect("Failed to init primary surface");
+                }
+                self.card
+                    .atomic_commit(
+                        AtomicCommitFlags::ALLOW_MODESET | AtomicCommitFlags::NONBLOCK
+                            | AtomicCommitFlags::PAGE_FLIP_EVENT,
+                        atomic_req,
+                    )
+                    .expect("Failed to set mode");
+            }
+            if !new_displays.is_empty() {
+                self.displays.extend(new_displays.into_iter());
+                for display in self.displays.iter_mut() {
+                    let name = &display.name;
+                    let pos = config
+                        .get::<DisplayPosition>(&CompositorConfig::offset_key(name));
+                    if let Some(pos) = pos {
+                        display.pos = pos.into();
+                    }
+                }
+                true
+            } else {
+                false
+            }
+        }
     }
 }
 use config::Config;
-use gbm::BufferObject;
-use nix::fcntl::fcntl;
-use nix::fcntl::FcntlArg;
-use nix::fcntl::OFlag;
+use taffy::NodeId;
 use crate::card::Card;
 use crate::config::CompositorConfig;
 use crate::display::Display;
-use crate::display::init_displays;
-use crate::fourcc::FourCc;
-use crate::quadtree::Quadtree;
+use crate::gpu::GpuContext;
 use crate::util::BackgroundImage;
-use crate::util::Bounds2;
 use crate::util::GlFns;
-use crate::util::arrange_displays;
-use crate::util::create_context;
+use crate::util::layout_displays;
 use drm::buffer::DrmFourcc;
-use drm::control::AtomicCommitFlags;
 use drm::control::Device as ControlDevice;
-use drm::control::atomic;
-use drm::control::connector;
 use gbm::AsRaw;
 use gbm::BufferObjectFlags;
 use image::DynamicImage;
 use image::GenericImage;
-use khregl::ATTRIB_NONE;
-use khregl::ClientBuffer;
-use khregl::Context;
+use nix::fcntl::FcntlArg;
+use nix::fcntl::OFlag;
+use nix::fcntl::fcntl;
 use notify::Event as NotifyEvent;
 use notify::RecursiveMode;
 use notify::Watcher;
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::ffi::c_void;
 use std::sync::Arc;
 use std::time::Duration;
 use std::time::Instant;
+use taffy::TaffyTree;
 const EGL_NO_CONTEXT: *mut c_void = std::ptr::null_mut();
 const EGL_PLATFORM_GBM_KHR: u32 = 0x31D7;
 const EGL_LINUX_DMA_BUF_EXT: u32 = 0x3270;
@@ -2269,38 +2292,20 @@ fn main() {
             }
         })
         .collect::<Vec<_>>();
-    let cards = Box::leak(Box::new(cards));
     let mut contexts = Vec::new();
     let bg = load_default_bg();
     let aligned_width = (bg.width() + 15) & !15;
     let aligned_height = (bg.height() + 15) & !15;
     let mut padded = DynamicImage::new_rgba8(aligned_width, aligned_height);
     padded.copy_from(&bg, 0, 0).unwrap();
-    for card in cards.iter() {
-        let gbm = gbm::Device::new(card).expect("Failed to init GBM with device");
-        let egl = unsafe {
-            Arc::new(
-                khregl::DynamicInstance::<khregl::EGL1_5>::load_required()
-                    .expect("unable to load libEGL.so.1"),
-            )
-        };
-        let egldisplay = unsafe {
-            egl.get_platform_display(
-                EGL_PLATFORM_GBM_KHR,
-                gbm.as_raw() as *mut c_void,
-                &[ATTRIB_NONE],
-            )
-        }
-            .expect("Failed to get platform display");
-        egl.initialize(egldisplay).expect("Failed to initialize display");
-        let (eglctx, eglconfig) = create_context(egl.as_ref(), egldisplay);
-        gl::load_with(|name| {
-            egl
-                .get_proc_address(name)
-                .map(|ptr| ptr as *const _)
-                .unwrap_or(std::ptr::null())
-        });
-        let gl_fns = GlFns::load(&egl);
+    for card in cards.into_iter() {
+        let card: Box<Card> = Box::new(card);
+        let card_ptr: *mut Card = Box::leak(card);
+        let card_ptr_clone: *const Card = card_ptr as *const Card;
+        let card_ref: &'static Card = unsafe { &*card_ptr_clone };
+        let card: Box<Card> = unsafe { Box::from_raw(card_ptr) };
+        let gbm: gbm::Device<&'static Card> = gbm::Device::new(card_ref)
+            .expect("Failed to init GBM with device");
         let mut bgbo = gbm
             .create_buffer_object::<
                 (),
@@ -2316,54 +2321,20 @@ fn main() {
                 },
             )
             .unwrap();
-        let egl_image = unsafe {
-            egl.create_image(
-                    egldisplay,
-                    Context::from_ptr(EGL_NO_CONTEXT),
-                    EGL_NATIVE_PIXMAP_KHR,
-                    ClientBuffer::from_ptr(bgbo.as_raw() as *mut c_void),
-                    &[ATTRIB_NONE],
-                )
-                .expect("Failed to create EGL image")
-        };
-        let bg = unsafe {
-            let mut tex_id = 0;
-            gl::GenTextures(1, &mut tex_id);
-            gl::BindTexture(gl::TEXTURE_2D, tex_id);
-            (gl_fns.EGLImageTargetTexture2DOES)(gl::TEXTURE_2D, egl_image.as_ptr());
-            let mut fb_id = 0;
-            gl::GenFramebuffers(1, &mut fb_id);
-            gl::BindFramebuffer(gl::FRAMEBUFFER, fb_id);
-            gl::FramebufferTexture2D(
-                gl::FRAMEBUFFER,
-                gl::COLOR_ATTACHMENT0,
-                gl::TEXTURE_2D,
-                tex_id,
-                0,
-            );
-            BackgroundImage {
-                bo: bgbo,
-                egl_image,
-                tex_id,
-                fb_id,
-            }
-        };
-        contexts.push((card, gbm, egl, egldisplay, eglctx, eglconfig, bg));
+        let displays: Vec<Display> = Vec::new();
+        let context = GpuContext { card, gbm, displays };
+        contexts.push(context);
     }
     let end = Instant::now() + Duration::from_secs(5);
     let mut frame = 0usize;
-    let mut display_tree: Quadtree<Display> = Quadtree::new(
-        Bounds2::new((0, 0).into(), VIRTUAL_SCREEN_EXTENTS.into()),
-    );
+    let mut layout: TaffyTree<String> = TaffyTree::new();
+    let mut leaf_ids: Vec<NodeId> = Vec::new();
     loop {
+        let mut displays_acquired = false;
         match rx.try_recv() {
             Ok(Ok(NotifyEvent { .. })) => {
                 if let Ok(new_config) = Config::new(&config_path) {
                     config = new_config;
-                    display_tree = arrange_displays(
-                        display_tree.into_objects(),
-                        &config,
-                    );
                 }
             }
             Ok(Err(_)) => {}
@@ -2375,14 +2346,14 @@ fn main() {
                         static __CALLSITE: ::tracing::callsite::DefaultCallsite = {
                             static META: ::tracing::Metadata<'static> = {
                                 ::tracing_core::metadata::Metadata::new(
-                                    "event compositor/src/main.rs:221",
-                                    "compositor",
+                                    "event dreampipe/src/main.rs:171",
+                                    "dreampipe",
                                     ::tracing::Level::WARN,
                                     ::tracing_core::__macro_support::Option::Some(
-                                        "compositor/src/main.rs",
+                                        "dreampipe/src/main.rs",
                                     ),
-                                    ::tracing_core::__macro_support::Option::Some(221u32),
-                                    ::tracing_core::__macro_support::Option::Some("compositor"),
+                                    ::tracing_core::__macro_support::Option::Some(171u32),
+                                    ::tracing_core::__macro_support::Option::Some("dreampipe"),
                                     ::tracing_core::field::FieldSet::new(
                                         &["message"],
                                         ::tracing_core::callsite::Identifier(&__CALLSITE),
@@ -2441,149 +2412,22 @@ fn main() {
                 }
             }
         }
-        for (card, gbm, egl, egldisplay, eglctx, eglconfig, bg) in contexts.iter_mut() {
-            let ignore_list = HashSet::<
-                String,
-            >::from_iter(
-                display_tree
-                    .select_all_items()
-                    .iter()
-                    .map(|(_, display)| display.name().to_owned()),
-            );
-            let mut new_displays = init_displays(
-                    ignore_list,
-                    card,
-                    gbm,
-                    egl,
-                    egldisplay,
-                    eglconfig,
-                )
-                .expect("Failed to init displays")
-                .into_iter()
-                .collect::<Vec<_>>();
-            for (display, initial_primary_bo, initial_cursor_bo) in new_displays
-                .iter_mut()
-            {
-                {
-                    ::std::io::_print(
-                        format_args!("Found display {0}\n", display.name()),
-                    );
-                };
-                egl.make_current(
-                        *egldisplay,
-                        Some(display.primary.eglsurface),
-                        Some(display.primary.eglsurface),
-                        Some(*eglctx),
-                    )
-                    .expect("Failed to make surface current");
-                let mut atomic_req = atomic::AtomicModeReq::new();
-                let initial_primary_fb = card
-                    .add_framebuffer(
-                        initial_primary_bo,
-                        DRM_FORMAT.depth(),
-                        DRM_FORMAT.bpp(),
-                    )
-                    .expect("Failed to get initial framebuffer");
-                display
-                    .init_req(card, initial_primary_fb, &mut atomic_req)
-                    .expect("Failed to init display");
-                card.atomic_commit(
-                        AtomicCommitFlags::ALLOW_MODESET | AtomicCommitFlags::NONBLOCK
-                            | AtomicCommitFlags::PAGE_FLIP_EVENT,
-                        atomic_req,
-                    )
-                    .expect("Failed to set mode");
-                card.destroy_framebuffer(initial_primary_fb)
-                    .expect("Failed to destroy initial framebuffer");
-            }
-            if !new_displays.is_empty() {
-                let displays = display_tree
-                    .into_objects()
-                    .into_iter()
-                    .chain(new_displays.into_iter().map(|(display, _, _)| display))
-                    .collect();
-                display_tree = arrange_displays(displays, &config);
-            }
-            let events = match card.receive_events() {
-                Ok(events) => events.peekable(),
-                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => continue,
-                Err(e) => {
-                    ::core::panicking::panic_fmt(format_args!("{0}", e));
-                }
-            };
-            events
-                .for_each(|event| {
-                    match event {
-                        drm::control::Event::PageFlip(event) => {
-                            let mut to_remove = Vec::new();
-                            for (id, display) in display_tree.select_all_items_mut() {
-                                if display.crtc != event.crtc {
-                                    continue;
-                                }
-                                egl.make_current(
-                                        *egldisplay,
-                                        Some(display.primary.eglsurface),
-                                        None,
-                                        Some(*eglctx),
-                                    )
-                                    .expect("Failed to make surface current");
-                                unsafe {
-                                    gl::BindFramebuffer(gl::DRAW_FRAMEBUFFER, 0);
-                                    gl::BindFramebuffer(gl::READ_FRAMEBUFFER, bg.fb_id);
-                                    gl::BlitFramebuffer(
-                                        0,
-                                        0,
-                                        aligned_width as i32,
-                                        aligned_height as i32,
-                                        0,
-                                        0,
-                                        aligned_width as i32,
-                                        aligned_height as i32,
-                                        gl::COLOR_BUFFER_BIT,
-                                        gl::LINEAR,
-                                    );
-                                }
-                                match unsafe {
-                                    display.primary.swap(card, egl, egldisplay)
-                                } {
-                                    Ok(()) => {}
-                                    Err(_) => {
-                                        if let Ok(info) = card
-                                            .get_connector(display.connector, false)
-                                        {
-                                            if info.state() != connector::State::Connected {
-                                                to_remove.push(id);
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                            for id in to_remove {
-                                if let Some(display) = display_tree.remove(id) {
-                                    for fb in display
-                                        .primary
-                                        .fbs
-                                        .into_inner()
-                                        .values()
-                                        .chain(display.cursor.fbs.into_inner().values())
-                                    {
-                                        card.destroy_framebuffer(*fb).ok();
-                                    }
-                                    for overlay in display.overlays.into_iter() {
-                                        for fb in overlay.fbs.into_inner().values() {
-                                            card.destroy_framebuffer(*fb).ok();
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                        _ => {}
-                    }
-                });
+        for context in contexts.iter_mut() {
+            context.update();
+            displays_acquired |= context.init_displays(&config);
         }
         if Instant::now().checked_duration_since(end).is_some() {
             break;
         }
         frame += 1;
+        if displays_acquired {
+            let displays: HashMap<String, &mut Display> = contexts
+                .iter_mut()
+                .map(|context| context.displays_mut())
+                .flatten()
+                .map(|display| (display.name.to_owned(), display))
+                .collect();
+            (layout, leaf_ids) = layout_displays(displays);
+        }
     }
 }
