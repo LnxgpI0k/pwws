@@ -1,17 +1,16 @@
 mod buffer;
-mod card;
-mod config;
+mod context;
 mod display;
 mod error;
 mod fourcc;
 mod gpu;
 mod util;
 
-use config::Config;
-use crate::card::Card;
-use crate::card::AppContext;
-use crate::config::CompositorConfig;
+use crate::context::AppContext;
+use crate::context::Card;
 use crate::display::Display;
+use crate::util::config::CompositorConfig;
+use crate::util::config::Config;
 use crate::util::layout_displays;
 use nix::fcntl::FcntlArg;
 use nix::fcntl::OFlag;

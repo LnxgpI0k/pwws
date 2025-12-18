@@ -1,7 +1,7 @@
 use ash::vk::ImportMemoryFdInfoKHR;
 use ash::vk::SubresourceLayout;
 use ash::vk;
-use crate::card::Card;
+use crate::context::Card;
 use crate::error::CompositorError;
 use crate::error::CompositorResult;
 use crate::fourcc::FourCc;

@@ -1,12 +1,12 @@
 pub use drm::control::Device as ControlDevice;
-use crate::config::CompositorConfig;
-use crate::config::Config;
 use crate::display::Display;
 use crate::error::CompositorError;
 use crate::error::CompositorResult;
 use crate::gpu::init_gpu;
 use crate::gpu::load_default_bg;
 use crate::util::DisplayPosition;
+use crate::util::config::CompositorConfig;
+use crate::util::config::Config;
 use drm::Device;
 use drm::control::AtomicCommitFlags;
 use drm::control::atomic;

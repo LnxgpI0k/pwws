@@ -1,20 +1,20 @@
-use drm::control;
+pub use drm::control::Device as ControlDevice;
+use crate::buffer::CURSOR_DIM;
+use crate::buffer::DrmCtx;
+use crate::context::Card;
+use crate::error::CompositorError;
+use crate::error::CompositorResult;
+use drm::ClientCapability;
+use drm::Device;
+use drm::control::PlaneType;
 use drm::control::atomic;
+use drm::control::connector;
 use drm::control::crtc;
 use drm::control::plane;
 use drm::control::property;
-pub use drm::control::Device as ControlDevice;
-use drm::control::PlaneType;
+use drm::control;
 use std::collections::HashMap;
 use std::collections::HashSet;
-use drm::control::connector;
-use drm::ClientCapability;
-use drm::Device;
-use crate::buffer::DrmCtx;
-use crate::buffer::CURSOR_DIM;
-use crate::error::CompositorError;
-use crate::error::CompositorResult;
-use crate::card::Card;
 
 #[allow(unused)]
 fn print_formats(card: &Card, plane: plane::Handle) {
