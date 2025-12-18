@@ -4,6 +4,8 @@ use crate::config::Config;
 use crate::display::Display;
 use crate::error::CompositorError;
 use crate::error::CompositorResult;
+use crate::gpu::init_gpu;
+use crate::gpu::load_default_bg;
 use crate::util::DisplayPosition;
 use drm::Device;
 use drm::control::AtomicCommitFlags;
@@ -71,15 +73,55 @@ impl Device for Card { }
 
 impl ControlDevice for Card { }
 
-pub struct GpuContext {
+pub struct AppContext {
   pub card: Box<Card>,
   pub gbm: gbm::Device<&'static Card>,
   pub gpu: wgpu::Device,
-  // pub bg: BackgroundImage,
+  pub adapter: wgpu::Adapter,
+  pub queue: wgpu::Queue,
+  pub bg_bindgroup: wgpu::BindGroup,
   pub displays: Vec<Display>,
 }
 
-impl GpuContext {
+impl AppContext {
+  pub async fn init(card: Card) -> Self {
+    // Put the opaque card pointer on the heap to allow us to move owned pointers to it without moving the card memory itself
+    let card: Box<Card> = Box::new(card);
+
+    // Consume the box without deallocating it, returning a pointer to the heap memory
+    let card_ptr: *mut Card = Box::leak(card);
+
+    // Clone the raw pointer as const
+    let card_ptr_clone: *const Card = card_ptr as *const Card;
+
+    // Convert the pointer to a static reference (lives for lifetime of program)
+    let card_ref: &'static Card = unsafe {
+      &*card_ptr_clone
+    };
+
+    // Take back ownership of the heap memory so it is freed when the program exits
+    let card: Box<Card> = unsafe {
+      Box::from_raw(card_ptr)
+    };
+
+    // Use the static reference
+    let gbm: gbm::Device<&'static Card> =
+      gbm::Device::new(card_ref).expect("Failed to init GBM with device");
+    let (gpu, adapter, queue) =
+      init_gpu(card_ref).await.expect("Failed to init wgpu");
+    let bg_bindgroup = load_default_bg(card_ref, &gpu, &queue);
+    let displays: Vec<Display> = Vec::new();
+    AppContext {
+      card,
+      gbm,
+      gpu,
+      adapter,
+      queue,
+      bg_bindgroup,
+      displays,
+    }
+  }
+
   /// Returns true if display state was updated (eg a display disconnected)
   pub fn update(&mut self) -> bool {
     let events = match self.card.receive_events() {
